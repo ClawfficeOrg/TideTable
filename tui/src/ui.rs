@@ -3,6 +3,7 @@
 
 use std::sync::OnceLock;
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -10,6 +11,7 @@ use ratatui::widgets::{
     Block, BorderType, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
     Tabs, Wrap,
 };
+use ratatui::widgets::{StatefulWidget, Widget};
 use ratatui::Frame;
 
 use crate::app::{App, Divider, Entry, Hit, Kind, Load, Mode, Tab};
@@ -75,8 +77,46 @@ pub fn wordmark(app: &App) -> Vec<Span<'static>> {
     ]
 }
 
+/// The drawing code's view of a [`Buffer`]: the two `Frame` calls it uses, so the same code
+/// renders into a whole terminal or into one `Rect` of an embedder's buffer.
+pub struct Canvas<'a> {
+    buf: &'a mut Buffer,
+}
+
+impl<'a> Canvas<'a> {
+    pub fn new(buf: &'a mut Buffer) -> Self {
+        Self { buf }
+    }
+
+    fn render_widget(&mut self, w: impl Widget, area: Rect) {
+        w.render(area, self.buf);
+    }
+
+    fn render_stateful_widget<W: StatefulWidget>(
+        &mut self,
+        w: W,
+        area: Rect,
+        state: &mut W::State,
+    ) {
+        w.render(area, self.buf, state);
+    }
+
+    fn buffer_mut(&mut self) -> &mut Buffer {
+        self.buf
+    }
+}
+
+/// The whole terminal frame; the standalone binary's entry point.
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    render(area, f.buffer_mut(), app);
+}
+
+/// Draw the app into `area` of `buf`. Hit rectangles are in `buf` coordinates, so an embedder
+/// passes mouse events through unchanged. `area` is clipped to the buffer first.
+pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
+    let area = area.intersection(buf.area);
+    let f = &mut Canvas::new(buf);
     app.hits.clear();
     app.divider = None;
     f.render_widget(Block::new().style(app.theme.base()), area);
@@ -106,7 +146,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// Offline is the one state every mode must show, so it owns the bottom row's right edge.
-fn draw_offline(f: &mut Frame, app: &App, area: Rect) {
+fn draw_offline(f: &mut Canvas<'_>, app: &App, area: Rect) {
     let Some((st, text)) = app.conn_label() else {
         return;
     };
@@ -124,7 +164,7 @@ fn draw_offline(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The last action's result over the bottom row; a refusal keeps the CLI's own words.
-fn draw_toast(f: &mut Frame, app: &App, area: Rect) {
+fn draw_toast(f: &mut Canvas<'_>, app: &App, area: Rect) {
     let Some((msg, err)) = &app.toast else { return };
     let row = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
     let st = if *err { Status::Blocked } else { Status::Done };
@@ -143,7 +183,7 @@ fn draw_toast(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Sized to content, anchored under the selected row, list left visible around it.
-fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
+fn draw_dialog(f: &mut Canvas<'_>, app: &App, area: Rect) {
     let Some(d) = &app.dialog else { return };
     let w = area.width.saturating_sub(2).clamp(1, 60);
     let inner = w.saturating_sub(4) as usize;
@@ -205,7 +245,7 @@ fn draw_dialog(f: &mut Frame, app: &App, area: Rect) {
 /// Below this width the detail panel goes under the list instead of beside it.
 const SIDE_BY_SIDE_MIN: u16 = 110;
 
-fn draw_standard(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_standard(f: &mut Canvas<'_>, app: &mut App, area: Rect) {
     let big = area.width >= 40 && area.height >= 24 && app.theme.depth != Depth::Mono;
     let head_h = if big { 6 } else { 2 };
     let [head, tabs, body, foot] = Layout::vertical([
@@ -231,7 +271,7 @@ fn draw_standard(f: &mut Frame, app: &mut App, area: Rect) {
             body,
             vertical: false,
         });
-        draw_list(f, app, list, app.tab, true);
+        draw_list(f, app, list, app.tab, app.focused);
         draw_detail(f, app, detail);
     } else if body.height >= 16 {
         let [list, detail] =
@@ -241,10 +281,10 @@ fn draw_standard(f: &mut Frame, app: &mut App, area: Rect) {
             body,
             vertical: true,
         });
-        draw_list(f, app, list, app.tab, true);
+        draw_list(f, app, list, app.tab, app.focused);
         draw_detail(f, app, detail);
     } else {
-        draw_list(f, app, body, app.tab, true);
+        draw_list(f, app, body, app.tab, app.focused);
     }
 
     let hints = app.hints();
@@ -279,7 +319,7 @@ fn draw_standard(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect, big: bool) {
+fn draw_header(f: &mut Canvas<'_>, app: &App, area: Rect, big: bool) {
     let mut text_area = area;
     if big {
         let [art, rest] =
@@ -317,7 +357,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, big: bool) {
     f.render_widget(Paragraph::new(lines), text_area);
 }
 
-fn draw_sprite(f: &mut Frame, app: &App, area: Rect) {
+fn draw_sprite(f: &mut Canvas<'_>, app: &App, area: Rect) {
     let t = &app.theme;
     let colour = |c: char| match c {
         '#' => Some(t.accent),
@@ -363,7 +403,7 @@ fn tab_label(app: &App, tab: Tab) -> String {
     }
 }
 
-fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_tabs(f: &mut Canvas<'_>, app: &mut App, area: Rect) {
     let mut x = area.x;
     let mut titles = vec![];
     for tab in Tab::ALL {
@@ -416,18 +456,37 @@ fn empty_copy(tab: Tab) -> &'static str {
     }
 }
 
-fn draw_state(f: &mut Frame, app: &App, area: Rect) {
+fn draw_state(f: &mut Canvas<'_>, app: &App, area: Rect) {
     let (head, body, style) = match &app.load {
         Load::Loading => (
             "Loading…",
             "Asking tidetable for the current state.".to_string(),
             app.theme.dim(),
         ),
-        Load::Failed(m) => (
-            "Could not read the todo file",
-            m.clone(),
-            Style::new().fg(app.theme.danger),
-        ),
+        Load::Failed(m) => {
+            // One line in every mode, so a pane a few rows high (an embedder's sidebar) still says
+            // what is wrong instead of losing the reason under its heading.
+            let text = format!(
+                "{} Could not read the todo file · {}",
+                Status::Blocked.icon(),
+                m.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+            let pad = if area.width > 8 { 1 } else { 0 };
+            let row = Rect::new(
+                area.x + pad,
+                area.y,
+                area.width - pad * 2,
+                area.height.min(1),
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    trunc(&text, row.width as usize),
+                    Style::new().fg(app.theme.danger),
+                )),
+                row,
+            );
+            return;
+        }
         Load::Pick(files) => {
             let mut lines = vec![
                 Line::from(Span::styled(
@@ -542,7 +601,7 @@ fn entry_lines(app: &App, e: &Entry, selected: bool, width: usize) -> Vec<Line<'
     lines
 }
 
-pub fn draw_list(f: &mut Frame, app: &mut App, area: Rect, tab: Tab, focused: bool) {
+pub fn draw_list(f: &mut Canvas<'_>, app: &mut App, area: Rect, tab: Tab, focused: bool) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(app.theme.border_style(focused))
@@ -722,7 +781,7 @@ pub fn detail_lines(app: &App) -> Vec<Line<'static>> {
     out
 }
 
-fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
+fn draw_detail(f: &mut Canvas<'_>, app: &App, area: Rect) {
     let block = Block::new()
         .style(app.theme.panel())
         .padding(Padding::new(2, 2, 1, 0));
@@ -781,7 +840,7 @@ fn item_line(app: &App, width: usize, st: Status, id: &str, title: &str) -> Line
     ])
 }
 
-fn draw_side(f: &mut Frame, app: &App, area: Rect) {
+fn draw_side(f: &mut Canvas<'_>, app: &App, area: Rect) {
     let w = area.width.saturating_sub(2) as usize;
     let s = &app.snap;
     if app.load != Load::Ready {
@@ -857,7 +916,7 @@ fn draw_side(f: &mut Frame, app: &App, area: Rect) {
 
 // ---------------------------------------------------------------- bottom
 
-fn draw_bottom(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_bottom(f: &mut Canvas<'_>, app: &mut App, area: Rect) {
     if app.load != Load::Ready {
         draw_state(f, app, area);
         return;
@@ -948,6 +1007,7 @@ fn draw_bottom(f: &mut Frame, app: &mut App, area: Rect) {
     if area.height >= 4 {
         let list = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
         let tab = app.tab;
-        draw_list(f, app, list, tab, true);
+        let focused = app.focused;
+        draw_list(f, app, list, tab, focused);
     }
 }

@@ -197,6 +197,8 @@ pub struct App {
     pub toast: Option<(String, bool)>,
     /// A todo file the user chose in the picker; main hands it to the source.
     pub chosen: Option<std::path::PathBuf>,
+    /// The list border is lit only while the host routes input here; always true standalone.
+    pub focused: bool,
 }
 
 /// The draggable boundary between list and detail, as drawn last frame.
@@ -254,6 +256,7 @@ impl App {
             pending: None,
             toast: None,
             chosen: None,
+            focused: true,
         }
     }
 
@@ -650,7 +653,7 @@ impl App {
 
 /// Carry out the confirmed action through the source. A refusal is shown as the CLI worded it
 /// and leaves the snapshot untouched; success asks for a refresh.
-pub fn run_pending(app: &mut App, source: &mut impl Source) {
+pub fn run_pending(app: &mut App, source: &mut (impl Source + ?Sized)) {
     let Some(action) = app.pending.take() else {
         return;
     };

@@ -635,6 +635,7 @@ fn live_and_polling_get_icon_and_word_and_local_shows_nothing() {
     assert!(render(&mut a, 100, 30).1.contains("· polling"));
 }
 
+#[cfg(feature = "hub")]
 #[test]
 fn a_token_never_reaches_a_frame_even_in_a_failure_message() {
     use tidetable_tui::hub::{redact_url, UreqHttp};

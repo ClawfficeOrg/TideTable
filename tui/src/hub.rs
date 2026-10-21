@@ -6,6 +6,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+#[cfg(feature = "hub")]
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -47,12 +48,14 @@ fn pct(s: &str) -> String {
     out
 }
 
+#[cfg(feature = "hub")]
 pub struct UreqHttp {
     agent: ureq::Agent,
     base: String,
     token: Option<String>,
 }
 
+#[cfg(feature = "hub")]
 impl std::fmt::Debug for UreqHttp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UreqHttp")
@@ -62,6 +65,7 @@ impl std::fmt::Debug for UreqHttp {
     }
 }
 
+#[cfg(feature = "hub")]
 impl UreqHttp {
     pub fn new(base: &str, token: Option<String>) -> Result<Self, String> {
         let base = base.trim().trim_end_matches('/').to_string();
@@ -136,6 +140,7 @@ impl UreqHttp {
     }
 }
 
+#[cfg(feature = "hub")]
 impl Http for UreqHttp {
     fn get(&self, path: &str) -> Result<Value, String> {
         let resp = self.req("GET", path).call().map_err(|e| self.fail(e))?;
@@ -277,6 +282,7 @@ pub fn pump(reader: impl std::io::Read, tx: &Sender<StreamMsg>) -> usize {
     n
 }
 
+#[cfg(feature = "hub")]
 /// Background reader. Reconnects with a growing pause; a hub without a stream ends the thread.
 pub fn spawn_stream(http: UreqHttp, slug: String, tx: Sender<StreamMsg>) {
     std::thread::spawn(move || {
@@ -345,6 +351,7 @@ mod tests {
         assert_eq!(redact_url("http://hub:8080"), "http://hub:8080");
     }
 
+    #[cfg(feature = "hub")]
     #[test]
     fn debug_and_errors_never_carry_the_token() {
         let h = UreqHttp::new("http://127.0.0.1:1", Some("sekret-token".into())).unwrap();

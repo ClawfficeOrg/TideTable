@@ -13,6 +13,13 @@ serde_json = "1"
 # serde: derive for Snapshot and the CLI JSON shapes; serde_json needs it anyway.
 serde = { version = "1", features = ["derive"] }
 # ureq: small blocking HTTP client for the hub source (3.2.2); no async runtime.
-ureq = { version = "2", features = ["json"] }
+# Optional behind `hub`, so an embedder that only reads local todo files (Oarlock's sidebar)
+# builds without an HTTP stack. The `HubSource` logic and its `Http` trait stay ungated.
+ureq = { version = "2", features = ["json"], optional = true }
 tachyonfx = "0.25.2"
 tui-input = "0.15.5"
+
+[features]
+# The standalone binary talks to hubs; embedders opt out with `default-features = false`.
+default = ["hub"]
+hub = ["dep:ureq"]

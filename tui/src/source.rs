@@ -219,6 +219,8 @@ pub trait Source {
     fn snapshot(&mut self) -> Result<Snapshot, SourceError>;
     /// `Ok` is the CLI's confirmation line, `Err` its own refusal text.
     fn act(&mut self, action: &Action) -> Result<String, String>;
+    /// The picker's answer when several todo files matched; a source without a picker ignores it.
+    fn choose(&mut self, _file: PathBuf) {}
 }
 
 /// Runs one `tidetable` invocation and returns stdout. A trait so tests inject a fake.
@@ -331,6 +333,10 @@ impl<R: Runner> LocalSource<R> {
 }
 
 impl<R: Runner> Source for LocalSource<R> {
+    fn choose(&mut self, file: PathBuf) {
+        self.todo = Some(file);
+    }
+
     fn act(&mut self, action: &Action) -> Result<String, String> {
         let todo = match &self.todo {
             Some(t) => t.clone(),

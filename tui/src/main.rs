@@ -3,14 +3,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
-use tidetable_tui::app::{run_pending, App, Load, ModeArg};
-use tidetable_tui::hub::{spawn_stream, HubSource, StreamMsg, UreqHttp};
+use tidetable_tui::app::ModeArg;
+use tidetable_tui::hub::StreamMsg;
+#[cfg(feature = "hub")]
+use tidetable_tui::hub::{spawn_stream, HubSource, UreqHttp};
 use tidetable_tui::motion;
-use tidetable_tui::refresh::{Refresher, Watcher};
+use tidetable_tui::pane::{KeyOutcome, Pane};
 use tidetable_tui::review::Ticks;
 use tidetable_tui::source::{Action, CliRunner, LocalSource, Snapshot, Source, SourceError};
 use tidetable_tui::theme::Theme;
-use tidetable_tui::ui;
 
 const USAGE: &str = "usage: tidetable-tui [TODO_FILE | SLUG] [--mode auto|standard|side|bottom] [--palette NAME]\n\
                      \x20                   [--read-only] [--owner NAME] [--server URL] [--token TOKEN] [--local]\n\
@@ -60,14 +61,9 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
-fn now_epoch() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-}
-
 enum Backend {
     Local(LocalSource<CliRunner>),
+    #[cfg(feature = "hub")]
     Hub(HubSource<UreqHttp>),
 }
 
@@ -75,47 +71,58 @@ impl Source for Backend {
     fn snapshot(&mut self) -> Result<Snapshot, SourceError> {
         match self {
             Backend::Local(s) => s.snapshot(),
+            #[cfg(feature = "hub")]
             Backend::Hub(s) => s.snapshot(),
         }
     }
     fn act(&mut self, action: &Action) -> Result<String, String> {
         match self {
             Backend::Local(s) => s.act(action),
+            #[cfg(feature = "hub")]
             Backend::Hub(s) => s.act(action),
         }
     }
-}
-
-/// One snapshot into the app. `true` when the data is fresh.
-fn refresh(app: &mut App, source: &mut Backend) -> bool {
-    app.now_epoch = now_epoch();
-    match source.snapshot() {
-        Ok(s) => {
-            app.set_snapshot(s);
-            app.last_ok = Some(app.now_epoch);
-            true
-        }
-        Err(SourceError::Pick(files)) => {
-            app.load = Load::Pick(files);
-            true
-        }
-        // A hub that drops out keeps the last snapshot on screen; the footer says it is stale.
-        Err(_) if matches!(source, Backend::Hub(_)) && app.load == Load::Ready => false,
-        Err(e) => {
-            app.load = Load::Failed(e.to_string());
-            false
+    fn choose(&mut self, file: PathBuf) {
+        #[allow(irrefutable_let_patterns)]
+        if let Backend::Local(s) = self {
+            s.choose(file);
         }
     }
 }
 
-/// Widgets first, then tachyonfx over the finished buffer.
-fn draw(f: &mut ratatui::Frame, app: &mut App) {
-    ui::draw(f, app);
-    let rows = app.row_rects();
-    let area = f.area();
-    let accent = app.theme.accent;
-    app.fx
-        .run(f.buffer_mut(), area, &rows, accent, Instant::now());
+/// The hub backend plus the receiver its event-stream thread feeds.
+#[cfg(feature = "hub")]
+fn hub_backend(
+    url: &str,
+    slug: String,
+    token: Option<String>,
+    owner: Option<String>,
+) -> (mpsc::Receiver<StreamMsg>, Backend) {
+    let http = |t: Option<String>| UreqHttp::new(url, t);
+    let (main_http, stream_http) = match (http(token.clone()), http(token)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    spawn_stream(stream_http, slug.clone(), tx);
+    (
+        rx,
+        Backend::Hub(HubSource::new(main_http, slug).with_owner(owner)),
+    )
+}
+
+#[cfg(not(feature = "hub"))]
+fn hub_backend(
+    _url: &str,
+    _slug: String,
+    _token: Option<String>,
+    _owner: Option<String>,
+) -> (mpsc::Receiver<StreamMsg>, Backend) {
+    eprintln!("this tidetable-tui was built without the `hub` feature; use --local");
+    std::process::exit(2);
 }
 
 fn main() {
@@ -143,26 +150,14 @@ fn main() {
 
     let owner = Some(tidetable_tui::source::default_owner(args.owner.clone()));
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (rx, mut source) = match &server {
+    let (rx, source) = match &server {
         Some(url) => {
             let Some(slug) = args.file.clone() else {
                 eprintln!("hub mode needs a project slug\n{USAGE}");
                 std::process::exit(2);
             };
-            let http = |t: Option<String>| UreqHttp::new(url, t);
-            let (main_http, stream_http) = match (http(token.clone()), http(token.clone())) {
-                (Ok(a), Ok(b)) => (a, b),
-                (Err(e), _) | (_, Err(e)) => {
-                    eprintln!("{e}");
-                    std::process::exit(2);
-                }
-            };
-            let (tx, rx) = mpsc::channel();
-            spawn_stream(stream_http, slug.clone(), tx);
-            (
-                Some(rx),
-                Backend::Hub(HubSource::new(main_http, slug).with_owner(owner.clone())),
-            )
+            let (rx, backend) = hub_backend(url, slug, token, owner.clone());
+            (Some(rx), backend)
         }
         None => {
             let mut local =
@@ -174,32 +169,47 @@ fn main() {
         }
     };
     let hub = rx.is_some();
-    let mut app = App::new(theme, args.mode, Ticks::load(&cwd));
-    app.read_only = args.read_only;
-    app.motion = motion::enabled(|k| std::env::var(k).ok());
+    // The binary is a shell around the same pane an embedder draws: it owns the terminal and
+    // the event loop; the pane owns state, data and drawing.
+    let mut pane = Pane::new(theme, args.mode)
+        .with_ticks(Ticks::load(&cwd))
+        .with_source(source);
+    pane.set_hub(hub);
+    pane.set_focused(true);
+    pane.set_read_only(args.read_only);
+    pane.set_motion(motion::enabled(|k| std::env::var(k).ok()));
 
     // ratatui::init installs a panic hook that restores the terminal.
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-    let _ = terminal.draw(|f| draw(f, &mut app));
-    let mut refresher = Refresher::new(hub, Instant::now());
-    refresher.record(refresh(&mut app, &mut source) || !hub, Instant::now());
-    let mut watcher = Watcher::default();
+    let _ = terminal.draw(|f| pane.render(f.area(), f.buffer_mut()));
+    // The first tick takes the first snapshot.
+    pane.tick(Instant::now(), false);
     let mut dirty = true;
 
-    while !app.quit {
+    loop {
         // Repaint only when something changed: an idle TUI costs no frames.
-        if dirty && terminal.draw(|f| draw(f, &mut app)).is_err() {
+        if dirty
+            && terminal
+                .draw(|f| pane.render(f.area(), f.buffer_mut()))
+                .is_err()
+        {
             break;
         }
         dirty = false;
         // Fast wake-ups only while a pulse is live; otherwise block for the housekeeping tick.
-        let wait = if app.fx.live() { 50 } else { 250 };
+        let wait = if pane.animating() { 50 } else { 250 };
         match event::poll(Duration::from_millis(wait)) {
             Ok(true) => {
                 match event::read() {
-                    Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => app.on_key(k),
-                    Ok(Event::Mouse(m)) => app.on_mouse(m),
+                    Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                        if pane.handle_key(k) == KeyOutcome::Release {
+                            break;
+                        }
+                    }
+                    Ok(Event::Mouse(m)) => {
+                        pane.handle_mouse(m);
+                    }
                     Ok(_) => {}
                     Err(_) => break,
                 }
@@ -209,46 +219,17 @@ fn main() {
             Err(_) => break,
         }
 
-        let now = Instant::now();
-        if app.fx.live() {
-            dirty = true;
-        }
         let mut pushed = false;
         if let Some(rx) = &rx {
             for m in rx.try_iter() {
                 match m {
-                    StreamMsg::Connected => refresher.set_stream(true),
+                    StreamMsg::Connected => pane.set_stream(true),
                     StreamMsg::Changed => pushed = true,
-                    StreamMsg::Disconnected | StreamMsg::Unsupported => refresher.set_stream(false),
+                    StreamMsg::Disconnected | StreamMsg::Unsupported => pane.set_stream(false),
                 }
             }
-        } else if !app.snap.todo_file.is_empty() {
-            if !watcher.is_for(&app.snap.todo_file) {
-                watcher = Watcher::for_todo(&app.snap.todo_file);
-            }
-            pushed = watcher.changed();
         }
-
-        if app.pending.is_some() {
-            run_pending(&mut app, &mut source);
-            dirty = true;
-        }
-        if let Some(f) = app.chosen.take() {
-            if let Backend::Local(l) = &mut source {
-                l.choose(f);
-            }
-            app.want_refresh = true;
-        }
-        if app.want_refresh || refresher.due(now, pushed) {
-            app.want_refresh = false;
-            let ok = refresh(&mut app, &mut source);
-            refresher.record(ok || !hub, Instant::now());
-            dirty = true;
-        }
-        let conn = refresher.conn(Instant::now());
-        if conn != app.conn {
-            app.conn = conn;
-            app.now_epoch = now_epoch();
+        if pane.tick(Instant::now(), pushed) {
             dirty = true;
         }
     }
