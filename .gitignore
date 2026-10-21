@@ -56,3 +56,6 @@ tk.singularity.env
 # Scratch demo output
 /tk-addphase-demo.*
 tui/target/
+
+# Cargo workspace build output
+/target/
