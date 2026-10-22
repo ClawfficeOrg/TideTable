@@ -262,12 +262,28 @@ What changed in one long dogfooding session driving Swaygent with
   from the environment (`infisical run`), and the generated `opencode.json` holds
   `{env:...}` references, never values. A task already running when the window
   closes is not interrupted — only the *next* task reroutes to `fallback`.
+- **A Rust core may replace everything under TKRun, but `tkrun.py` stays
+  Python.** The seam is already a process boundary: `Runner.tk()` shells out to
+  `python -m tidetable` at eleven call sites, six distinct commands (`ready`,
+  `list`, `start`, `done`, `look-defer`, `reset`), so a Rust core only changes
+  that one line. Python is kept for TKRun because it is intentionally unstable
+  and the edit-run cycle is worth more there than the type safety.
+  `docs/rust-port.md` is the parity contract: the JSON shapes, exit codes and
+  refusal wording a port must reproduce. Two details are load-bearing and easy
+  to lose: `ready` and `next` exit `1` when nothing is runnable (that means
+  "no work", not "broken"), and `task_summary` overwrites a task's own `agent`
+  with the resolved tier while adding `agent_derived`.
 
 ## Known Gaps / Next
 
 - The lock is still cooperative. Stale locks now break themselves, but two
   processes racing on a filesystem without atomic `O_EXCL` (some network mounts)
   are still not protected.
+- `FileLock.__exit__` unlinks the lock file unguarded, so two processes racing on
+  one todo file can raise `PermissionError: [WinError 32]` when the other still
+  has it open. Observed once as an uncaught traceback out of `cmd_status`, not on
+  retry. Catch it like the existing `FileNotFoundError` rather than copying the
+  pattern into a rewrite.
 - A lease is not renewed while a task runs, so a task genuinely longer than the
   lease can be stolen mid-flight. Re-running `start` as the same owner refreshes
   it; a supervisor with long tasks should either do that periodically or raise
