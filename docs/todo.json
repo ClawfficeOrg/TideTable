@@ -848,6 +848,208 @@
           ]
         }
       ]
+    },
+    {
+      "id": "5.0",
+      "title": "Rust core",
+      "goal": "Move the TideTable core (todo model, scheduling, claims, validation, locking) into Rust so tidetable-tui and embedders such as Oarlock no longer need a Python install, while tkrun.py stays Python. docs/rust-port.md is the contract: six commands, exact JSON shapes, exit codes, refusal wording, and graded parity. Nothing here changes scheduling semantics; if a task would, it does not belong in this phase.",
+      "tasks": [
+        {
+          "id": "5.0.1",
+          "title": "Core crate, storage semantics and locking",
+          "status": "pending",
+          "goal": "New crates/tidetable-core, no GPUI and no printing: the task and phase model, load, atomic write, the append-only event log, and FileLock. Reuse tidetable/schema/todo-v1.schema.json verbatim rather than re-specifying the format. Reproduce the lock exactly: JSON payload with pid, host and at; stale when the pid is positively dead on this host or the file is older than 300s and liveness is unknown; exclusive create; 10s timeout polling every 50ms. The Windows liveness probe must return alive, dead or unknown using OpenProcess with PROCESS_QUERY_LIMITED_INFORMATION, never a signal probe, because os.kill(pid, 0) terminates the process there. do not copy the unguarded unlink in FileLock.__exit__: treat already-gone and still-open alike. Writes rename with retry, as jsonio.write_json does, because Windows refuses a rename over an open file.",
+          "touches": [
+            "crates/tidetable-core/src",
+            "tidetable/schema/todo-v1.schema.json"
+          ],
+          "success": [
+            "Loading and saving a todo file round-trips it byte-identically apart from reordering",
+            "Two processes racing for the lock: exactly one wins, the loser waits or times out cleanly, and no traceback escapes",
+            "A stale lock from a dead pid is broken and the reason is reported",
+            "Atomic write succeeds while another process holds the target open"
+          ],
+          "prerequisites": [],
+          "complexity": "High",
+          "agent": "pro_dev_agent",
+          "created_at": "2026-10-22T07:16:35Z",
+          "updated_at": "2026-10-22T07:16:35Z"
+        },
+        {
+          "id": "5.0.2",
+          "title": "Scheduling, conflicts and the read commands",
+          "status": "pending",
+          "goal": "Port the pure logic from cli.py onto the core crate: iteration and id ordering, blockers_for, ready_tasks, in_progress_tasks, find_next with resume and disjoint, blocked_report, phase_is_complete, complete_phase_ids, norm_path, paths_conflict, overlapping_paths, disjoint_tasks. Then the commands that only read: ready, next, list, deps, parallel, history. Match the JSON shapes in docs/rust-port.md section 3 exactly, including the two traps: ready and next exit 1 when nothing is runnable, which means no work rather than broken; and task_summary overwrites a task own agent with the resolved tier and adds agent_derived. list trims its tasks to id, title and status while ready does not.",
+          "touches": [
+            "crates/tidetable-core/src"
+          ],
+          "success": [
+            "ready, next, list, deps and parallel emit the same JSON as the Python CLI for every fixture state",
+            "ready and next exit 1 with an empty queue and 0 with work, matching the Python CLI",
+            "Disjoint selection and conflict reports match the Python CLI on overlapping touches"
+          ],
+          "prerequisites": [
+            "5.0.1"
+          ],
+          "complexity": "High",
+          "agent": "pro_dev_agent",
+          "created_at": "2026-10-22T07:16:42Z",
+          "updated_at": "2026-10-22T07:16:42Z"
+        },
+        {
+          "id": "5.0.3",
+          "title": "Validation and agent tier resolution",
+          "status": "pending",
+          "goal": "Port validate and the agents commands. Semantic validation covers duplicate ids, unresolved prerequisites, cycles and prerequisites left cancelled or moved, with the same warning-versus-error split as semantic_errors. Schema validation uses the JSON Schema crate, which removes the jsonschema-not-installed warning path, but validate must still print the same two success lines. Port agents.resolve_tiers and resolve_task with the layering order and _sources provenance, plus agents show, providers, use, set, unset and path. Note that agents takes --todo rather than a positional path; keep that as documented in AGENTS.md rather than tidying it.",
+          "touches": [
+            "crates/tidetable-core/src"
+          ],
+          "success": [
+            "validate reports the same findings and exit code as the Python CLI for valid, cyclic, duplicate-id and dangling-prerequisite files",
+            "agents show --json matches the Python CLI including _sources provenance",
+            "agents takes --todo, not a positional path, in every subcommand"
+          ],
+          "prerequisites": [
+            "5.0.1"
+          ],
+          "complexity": "Medium",
+          "agent": "mid_dev_agent",
+          "created_at": "2026-10-22T07:16:51Z",
+          "updated_at": "2026-10-22T07:16:51Z"
+        },
+        {
+          "id": "5.0.4",
+          "title": "Mutation commands and claim semantics",
+          "status": "pending",
+          "goal": "Port start, done, look-defer, look-queue, look-clear, reset and status, plus add and add-phase, under the lock. This is the slice TKRun depends on, so the semantics are the contract: start re-run by the same owner returns 0 with refreshed true; start refuses a live lease held by another owner; done on an already-done task returns 0; done and start refuse unmet prerequisites without --force; look-defer releases the claim and counts as done for dependencies. Keep the refusal wording from docs/rust-port.md byte-identical, including that start says blocked by where done says has unmet prerequisites, because TKRun writes both into .tkrun/log.md. Keep the mutation output lines too, notably the look-defer success line.",
+          "touches": [
+            "crates/tidetable-core/src"
+          ],
+          "success": [
+            "Every exit code and refusal string in docs/rust-port.md section 4 matches the Python CLI",
+            "start by the same owner is idempotent and reports refreshed true",
+            "A mutation appends the same event-log line as the Python CLI"
+          ],
+          "prerequisites": [
+            "5.0.2"
+          ],
+          "complexity": "High",
+          "agent": "pro_dev_agent",
+          "created_at": "2026-10-22T07:16:57Z",
+          "updated_at": "2026-10-22T07:16:57Z"
+        },
+        {
+          "id": "5.0.5",
+          "title": "Sidebar payload, convert and human renderers",
+          "status": "pending",
+          "goal": "Port sidebar.sidebar_payload and the budget algorithm, and convert. The sidebar JSON payload is the only thing harnesses consume, so it must match exactly: every plugin calls sidebar <todo> --json --width <w> --height <h> and renders the text itself. The human text of sidebar and the markdown of convert need structural parity only: keep the section set and the width budget that tests/test_sidebar.py asserts, and keep convert section headings and the per-phase per-task structure so generated docs do not churn in diffs. Do not assert byte equality on either.",
+          "touches": [
+            "crates/tidetable-core/src"
+          ],
+          "success": [
+            "sidebar --json matches the Python CLI payload for every fixture including tight height budgets",
+            "sidebar human text keeps every section and fits the width budget",
+            "convert output has the same headings and per-task structure as the Python CLI"
+          ],
+          "prerequisites": [
+            "5.0.2"
+          ],
+          "complexity": "Medium",
+          "agent": "mid_dev_agent",
+          "created_at": "2026-10-22T07:17:06Z",
+          "updated_at": "2026-10-22T07:17:06Z"
+        },
+        {
+          "id": "5.0.6",
+          "title": "Parity harness with golden fixtures",
+          "status": "pending",
+          "goal": "Build tests/parity: for each command capture argv, a fixture todo file and the environment, then run both the Python CLI and the Rust binary against a temp copy and compare by the tiers in docs/rust-port.md section 10. Byte-identical for JSON, refusal text and exit codes; structural for sidebar and convert text. One fixture per state: empty, all done, one ready, blocked by a task, blocked by a phase, in progress held by another owner, expired lease, needs_human_look queued, cancelled prerequisite, cycle, duplicate id, missing required field. Refusals need fixtures as much as happy paths. Include the concurrency fixture: two start calls racing one task, exactly one wins, the other exits 1, and it must run on Windows. This suite is the gate for switching tk().",
+          "touches": [
+            "tests/parity",
+            "crates/tidetable-core/src"
+          ],
+          "success": [
+            "The harness fails when a JSON key, type or exit code diverges, and passes when only sidebar or convert wording changes",
+            "Fixtures cover every state listed in the goal",
+            "The concurrency fixture passes on Windows"
+          ],
+          "prerequisites": [
+            "5.0.4",
+            "5.0.5"
+          ],
+          "complexity": "Medium",
+          "agent": "mid_dev_agent",
+          "created_at": "2026-10-22T07:17:19Z",
+          "updated_at": "2026-10-22T07:17:19Z"
+        },
+        {
+          "id": "5.0.7",
+          "title": "TUI reads the core in process",
+          "status": "pending",
+          "goal": "Replace the subprocess in tui/src/source.rs with calls to tidetable-core so the Rust TUI no longer needs a Python install. Keep the Http trait and the hub source as they are. The CliRunner stays behind a feature or a test-only path, because tests inject a fake runner and the binary must still be able to fall back while the port is in progress. The pane behaviour must not change: same refresh cadence, same unavailable line, same read-only behaviour.",
+          "touches": [
+            "tui/src",
+            "crates/tidetable-core/src"
+          ],
+          "success": [
+            "tidetable-tui reads and acts on a local todo file with tidetable not installed",
+            "Existing tui tests pass, with the fake runner replaced by an in-process source where it applies",
+            "cargo test and cargo clippy pass for the tui crate with and without default features"
+          ],
+          "prerequisites": [
+            "5.0.4"
+          ],
+          "complexity": "Medium",
+          "agent": "mid_dev_agent",
+          "created_at": "2026-10-22T07:17:29Z",
+          "updated_at": "2026-10-22T07:17:29Z"
+        },
+        {
+          "id": "5.0.8",
+          "title": "Hub server on the Rust core",
+          "status": "pending",
+          "goal": "Port serve to axum on tidetable-core: the route table from remote.ROUTES, token and slug scoping, sessions and the projection and live stream. Keep the API contract the same so tidetable --server URL keeps working unchanged, and keep the single-writer rule: the server owns writes, clients read. This matters here because TIDETABLE_SERVER is set on this machine, so hub mode is the normal path rather than an edge case. Commands with no route must still refuse as local-only, matching remote.LOCAL_ONLY.",
+          "touches": [
+            "crates/tidetable-core/src",
+            "src"
+          ],
+          "success": [
+            "The Python and Rust hubs answer every route identically for the same fixture, including auth and slug refusals",
+            "The TUI in hub mode works against the Rust server with the same payloads",
+            "Local-only commands refuse with the existing wording rather than falling back"
+          ],
+          "prerequisites": [
+            "5.0.4"
+          ],
+          "complexity": "High",
+          "agent": "pro_dev_agent",
+          "created_at": "2026-10-22T07:17:42Z",
+          "updated_at": "2026-10-22T07:17:42Z"
+        },
+        {
+          "id": "5.0.9",
+          "title": "Switch tk() to the Rust binary",
+          "status": "pending",
+          "goal": "Change Runner.tk() in tkrun.py to run the resolved Rust binary instead of python -m tidetable, and nothing else. Resolve the executable once at startup rather than trusting PATH, because the current line runs the Python module whatever tidetable.exe is installed. Keep --local for path arguments and the hub environment for slug arguments exactly as now. tkrun.py stays Python: this is the only file that changes, and it is one line plus the resolution. Gate the switch on the parity suite passing and the Windows concurrency fixture.",
+          "touches": [
+            "tidetable/tkrun.py"
+          ],
+          "success": [
+            "tkrun run works against a local todo file with the Rust binary and with Python uninstalled from PATH",
+            "tkrun run works in hub mode against the Rust server",
+            "Reverting is restoring the sys.executable form in one line",
+            "tests/test_tkrun.py passes unchanged"
+          ],
+          "prerequisites": [
+            "5.0.6",
+            "5.0.8"
+          ],
+          "complexity": "Low",
+          "agent": "basic_dev_agent",
+          "created_at": "2026-10-22T07:17:59Z",
+          "updated_at": "2026-10-22T07:17:59Z"
+        }
+      ]
     }
   ]
 }

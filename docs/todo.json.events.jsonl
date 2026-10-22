@@ -1,0 +1,10 @@
+{"at": "2026-10-22T07:16:15Z", "event": "add-phase", "phase": "5.0", "owner": "Morrissey5070Ti:64588", "title": "Rust core"}
+{"at": "2026-10-22T07:16:35Z", "event": "add", "task": "5.0.1", "owner": "Morrissey5070Ti:29048", "to": "pending", "complexity": "High", "agent": "pro_dev_agent"}
+{"at": "2026-10-22T07:16:42Z", "event": "add", "task": "5.0.2", "owner": "Morrissey5070Ti:59652", "to": "pending", "complexity": "High", "agent": "pro_dev_agent"}
+{"at": "2026-10-22T07:16:51Z", "event": "add", "task": "5.0.3", "owner": "Morrissey5070Ti:9104", "to": "pending", "complexity": "Medium", "agent": "mid_dev_agent"}
+{"at": "2026-10-22T07:16:57Z", "event": "add", "task": "5.0.4", "owner": "Morrissey5070Ti:53476", "to": "pending", "complexity": "High", "agent": "pro_dev_agent"}
+{"at": "2026-10-22T07:17:06Z", "event": "add", "task": "5.0.5", "owner": "Morrissey5070Ti:12212", "to": "pending", "complexity": "Medium", "agent": "mid_dev_agent"}
+{"at": "2026-10-22T07:17:19Z", "event": "add", "task": "5.0.6", "owner": "Morrissey5070Ti:44476", "to": "pending", "complexity": "Medium", "agent": "mid_dev_agent"}
+{"at": "2026-10-22T07:17:29Z", "event": "add", "task": "5.0.7", "owner": "Morrissey5070Ti:65168", "to": "pending", "complexity": "Medium", "agent": "mid_dev_agent"}
+{"at": "2026-10-22T07:17:42Z", "event": "add", "task": "5.0.8", "owner": "Morrissey5070Ti:39284", "to": "pending", "complexity": "High", "agent": "pro_dev_agent"}
+{"at": "2026-10-22T07:17:59Z", "event": "add", "task": "5.0.9", "owner": "Morrissey5070Ti:57124", "to": "pending", "complexity": "Low", "agent": "basic_dev_agent"}
