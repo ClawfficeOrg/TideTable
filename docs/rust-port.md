@@ -42,6 +42,13 @@ Rust binary lands, `tk()` changes one line:
 return run_proc([self.tt_exe, *head, *args], self.root, env=env)
 ```
 
+`self.tt_exe` is the binary path resolved once at startup, not a bare name from
+`PATH`. That matters even though the binary is called `tidetable`: the current
+line is `[sys.executable, "-m", "tidetable", ...]`, which runs the *Python
+module* and would keep doing so no matter what `tidetable.exe` sits on `PATH`.
+The switch is therefore explicit in `tk()`, and rolling back is putting the
+`sys.executable` form back.
+
 Everything in this document is the set of facts that makes that line safe.
 
 ### What is not ported
@@ -333,11 +340,28 @@ The success line for `look-defer` is `◐ Task 4.0.3 queued for a human look
 existing repo contains it. The parenthetical reports the status the task had
 immediately before, so it reads `(was in_progress)` when the task was claimed.
 
-### `--local` beats `$TIDETABLE_SERVER`
+### `--local` beats `$TIDETABLE_SERVER`; `--server` beats both
 
-TKRun passes `--local` in local mode specifically so an exported
-`TIDETABLE_SERVER` cannot redirect a path argument to a hub. The port must
-honour that precedence: explicit flag, then environment, then local file.
+Mode is decided by `remote.active()`: hub when a server URL is known, `--local`
+is absent, and the command has a route in `remote.ROUTES`.
+
+Precedence, highest first:
+
+1. `--server URL` — forces hub mode with no environment involved.
+2. `--local` — forces local mode and ignores `$TIDETABLE_SERVER`.
+3. `$TIDETABLE_SERVER` — hub when set.
+4. nothing — local file.
+
+So `--server` and `--local` are a complete pair; no third "force hub" flag is
+needed, because `--server` already supplies the URL explicitly. What the port
+must not break is the two consequences TKRun relies on:
+
+- `--local` wins over an exported `$TIDETABLE_SERVER`, which is why `tk()`
+  passes it for a path argument.
+- Commands absent from `ROUTES` are local-only. `LOCAL_ONLY` is
+  `{"convert", "release"}`, and hitting one with a server configured must
+  refuse with `` `convert` has no remote mode; run it against a local checkout
+  (or pass --local). `` rather than silently falling back.
 
 ### Environment
 
@@ -464,8 +488,9 @@ The port is only safe if a test can prove it. The method:
 1. **Golden fixtures.** For each command, capture `(argv, todo file, env)` and
    the Python CLI's `(stdout, exit code)`. Store both in `tests/parity/`.
 2. **Run both.** A harness executes the Python CLI and the Rust binary against
-   a temp copy of the same fixture and compares normalised output, key order
-   excluded.
+   a temp copy of the same fixture and compares output according to the tiers in
+   §10: byte-identical for JSON, refusal text and exit codes; structural for
+   `sidebar` and `convert` text.
 3. **Seed the todo file deliberately.** One fixture per interesting state:
    empty, all done, one ready, blocked by task, blocked by phase, in progress
    held by another owner, lease expired, needs_human_look queued,
@@ -498,13 +523,49 @@ keeping identical rather than "fixing" during the port, because
 
 ---
 
-## 10. Open questions
+## 10. Decisions and what parity applies to
 
-- Does hub mode need `--local`'s inverse spelled out, or is "no flag and
-  `TIDETABLE_SERVER` set" enough? TKRun currently assumes the latter.
-- Should the Rust binary be named `tidetable` (shadowing the Python console
-  script on PATH) or `tt-core` and selected explicitly? Shadowing makes the
-  switch invisible and the rollback scary; a separate name makes the switch one
-  line in `tk()` and is reversible.
-- `convert` and `sidebar` produce human text; do they need byte parity, or only
-  structural parity? Nothing machine-readable depends on them today.
+### The binary is named `tidetable`
+
+Same name as the Python console script, so a Rust build can replace it without
+every script, hook and `AGENTS.md` in the suite changing. The rollback is
+`pip install --force-reinstall` of the wheel, which is cheap because the Python
+package stays intact and published during the port — this is a reason to keep
+the two implementations side by side until Slice 2 is green, not to merge them.
+
+Because the name is shared, a wrong `tidetable` on `PATH` is indistinguishable
+from a right one. The Rust binary should therefore answer `--version` with
+something that identifies it (for example `tidetable 0.13.0 (rust)`), so a
+support report or a `--dry-run` log says which implementation ran.
+
+### Byte parity: only where a machine or the log reads it
+
+Three tiers, and the port should not spend effort above where it is needed.
+
+| Output | Requirement |
+| --- | --- |
+| `--json` from every command in §3 | exact keys, types, nesting; key order free |
+| Refusal and success text read by TKRun (`start`, `done`, `reset`, `look-defer`) | byte-identical, because it lands in `.tkrun/log.md` |
+| `ready`/`next` exit codes | exact |
+| `sidebar --json` | exact payload; this is the only thing harnesses consume |
+| `sidebar` human text | structural only |
+| `convert` markdown | structural only |
+
+The reason `sidebar` text needs no byte parity: every harness plugin calls
+`sidebar <todo> --json --width <w> --height <h>` and renders the text itself
+(`integrations/opencode/tk-sidebar.ts` has its own `renderText`). The Python
+`render_sidebar` is used only when a human runs the command in a terminal, so a
+Rust version that produces a different arrangement of the same sections is not
+a compatibility break. It should still keep the section set and the width
+budget, since those are what the tests in `tests/test_sidebar.py` assert.
+
+`convert` is the same story from the other direction: it writes a markdown file
+for human review, referenced in `docs/integration-guide.md` and
+`docs/philosophy.md`, and no code reads its output. Section headings and the
+per-phase/per-task structure should match so generated docs do not churn
+needlessly in diffs, but nothing should assert byte equality.
+
+### Already settled
+
+- **No `--hub` / `--remote` flag.** `--server URL` forces hub mode explicitly;
+  `--local` forces local. The pair in §4 is complete.

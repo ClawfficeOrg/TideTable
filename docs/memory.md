@@ -272,7 +272,11 @@ What changed in one long dogfooding session driving Swaygent with
   refusal wording a port must reproduce. Two details are load-bearing and easy
   to lose: `ready` and `next` exit `1` when nothing is runnable (that means
   "no work", not "broken"), and `task_summary` overwrites a task's own `agent`
-  with the resolved tier while adding `agent_derived`.
+  with the resolved tier while adding `agent_derived`. The binary keeps the name
+  `tidetable`, and parity is graded rather than universal: byte-identical for
+  `--json`, refusal text and exit codes, structural only for `sidebar` and
+  `convert` human text, because every harness plugin reads `sidebar --json` and
+  renders its own output.
 
 ## Known Gaps / Next
 
