@@ -289,7 +289,9 @@ CLI functions and return the `--json` shapes; POST routes (`start`, `done`,
 `reject` body flag (`tidetable look-clear SLUG ID --reject` over `--server`) to send the
 task back to `pending` instead of `done`. `POST /api/<slug>/heartbeat` records agent
 presence (repo, branch, task) with a 180s staleness horizon, and
-`GET /api/stream` replays the event log as SSE. Auth is a shared
+`GET /api/stream` replays the event log as SSE. `GET /api/projects` lists the
+registry's slugs and names, filtered to the projects the presented machine
+token may open (the shared `TK_API_TOKEN` sees all). Auth is a shared
 `TK_API_TOKEN` bearer today, per-project machine tokens
 (`tidetable/tokens.py`) next. Postgres (`deploy/migrations/001_init.sql`)
 is a read projection tailed by `tidetable/projector.py`, never a scheduler.

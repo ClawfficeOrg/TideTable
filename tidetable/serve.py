@@ -145,6 +145,30 @@ def bearer_auth(headers: Mapping[str, str], slug: str | None = None,
     return False, False
 
 
+def allowed_slugs(headers: Mapping[str, str], registry: str = DEFAULT_REGISTRY,
+                  tokens_db: str | None = None) -> list[str] | None:
+    """Slugs a presented machine token may see, or None for full access.
+
+    The shared TK_API_TOKEN and any unverified token (the caller already passed
+    auth) see everything. A scoped machine token sees exactly its slugs; that is
+    what keeps ``GET /api/projects`` from naming a project it cannot open.
+    """
+    presented = _extract_presented(headers)
+    if not presented:
+        return None
+    try:
+        verified = tokens_store.verify_token(
+            _resolve_tokens_db(registry, tokens_db), presented)
+    except (OSError, ValueError):
+        return None
+    if verified is None:
+        return None
+    slugs, _ = verified
+    if "*" in slugs:
+        return None
+    return list(slugs)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Argument parser for `tidetable serve`."""
     parser = argparse.ArgumentParser(
@@ -378,15 +402,21 @@ def format_sse(payload: dict, seq: int | None = None,
 
 def handle_get(route: str, slug: str | None, query: Mapping[str, str],
                registry: str = DEFAULT_REGISTRY,
-               sessions_db: str | None = None) -> tuple[int, dict]:
+               sessions_db: str | None = None,
+               visible_slugs: list[str] | None = None) -> tuple[int, dict]:
     """Serve one GET read by delegating to tidetable.cli — no DAG logic here.
 
     Returns (status, payload) where payload matches the CLI --json shape for
     the same read. Raises FileNotFoundError for a missing registry/todo file.
+    ``visible_slugs`` (a scoped machine token's slugs; None means all) filters
+    the project list so it never names a project the caller cannot open.
     """
     if route == "/api/projects":
         data = load_registry(registry)
-        return 200, {"projects": data.get("projects", [])}
+        projects = data.get("projects", [])
+        if visible_slugs is not None:
+            projects = [p for p in projects if p.get("slug") in visible_slugs]
+        return 200, {"projects": projects}
 
     if slug is None:
         return 400, {"error": "missing slug"}
@@ -1210,7 +1240,13 @@ class _Handler(BaseHTTPRequestHandler):
             registry = getattr(self.server, "registry", DEFAULT_REGISTRY)
             sessions_db = getattr(self.server, "sessions_db", None)
             try:
-                status, payload = handle_get(route, slug, query, registry, sessions_db)
+                visible = (allowed_slugs(
+                    self.headers,  # type: ignore[arg-type]
+                    registry,
+                    getattr(self.server, "tokens_db", None))
+                    if route == "/api/projects" else None)
+                status, payload = handle_get(
+                    route, slug, query, registry, sessions_db, visible)
             except FileNotFoundError as e:
                 self._send_json(404, {"error": f"not found: {e.filename or e}"})
                 return

@@ -2029,6 +2029,31 @@ class TestRemoteClient(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("no remote mode", out)
 
+    def test_project_list_is_scoped_to_the_token(self):
+        import urllib.request
+
+        from tidetable import tokens
+
+        registry = Path(self.tmp.name) / "registry.json"
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        data["projects"].append({
+            "slug": "other", "name": "Other", "repo_url": "",
+            "todo_path": self.todo_path, "default_branch": "main",
+        })
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        db = str(Path(self.tmp.name) / "tokens.db")
+        _, scoped, _ = tokens.mint_token(db, ["demo"], ["read"])
+
+        def slugs(token: str) -> list[str]:
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            req = urllib.request.Request(self.url + "/api/projects", headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                payload = json.load(resp)
+            return [p["slug"] for p in payload["projects"]]
+
+        self.assertEqual(slugs(scoped), ["demo"])
+        self.assertEqual(slugs(self.TOKEN), ["demo", "other"])
+
     def test_build_request_maps_flags_to_query_and_body(self):
         from tidetable import remote
 
