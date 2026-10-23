@@ -688,6 +688,35 @@ def add_task(data: dict, phase_id: str, title: str, **fields) -> dict | None:
 
 PHASE_ID_RE = re.compile(r"^[0-9]+\.[0-9]+$")
 
+#: Fields `edit_task` accepts. Status is deliberately absent: use `status`/`start`/`done`.
+EDITABLE_TASK_FIELDS = ("title", "goal", "touches", "success", "prerequisites",
+                        "complexity", "agent", "tests", "parallel_group")
+LIST_TASK_FIELDS = ("touches", "success", "prerequisites")
+
+
+def edit_task(data: dict, task_id: str, **fields) -> dict | None:
+    """Change plan fields on one task, in place. Returns it, or None when unknown.
+
+    Only the keys passed are touched, so an edit never resets status, claims or
+    timestamps it was not asked about. A list field is replaced wholesale (an
+    empty list clears it); ``None`` removes an optional scalar such as
+    ``tests`` or ``parallel_group``.
+    """
+    _, task = find_task(data, task_id)
+    if task is None:
+        return None
+    for key, value in fields.items():
+        if key not in EDITABLE_TASK_FIELDS:
+            raise ValueError(f"not an editable task field: {key}")
+        if key in LIST_TASK_FIELDS:
+            task[key] = [str(v) for v in (value or [])]
+        elif value is None:
+            task.pop(key, None)
+        else:
+            task[key] = value
+    task["updated_at"] = utc_now()
+    return task
+
 
 def add_phase(data: dict, phase_id: str, title: str, **fields) -> dict | None:
     """Insert a new phase. Returns it, or None when the ID is already taken.
@@ -1516,6 +1545,59 @@ def cmd_add(args) -> int:
     return 0
 
 
+def cmd_edit(args) -> int:
+    updates: dict = {}
+    for key in ("title", "goal", "tests", "complexity", "agent", "parallel_group"):
+        value = getattr(args, key)
+        if value is not None:
+            updates[key] = value
+    for key in ("touches", "success", "prereq"):
+        values = getattr(args, key)
+        if values is not None:
+            updates["prerequisites" if key == "prereq" else key] = values
+    if args.clear_touches:
+        updates["touches"] = []
+    if args.clear_success:
+        updates["success"] = []
+    if args.clear_prereq:
+        updates["prerequisites"] = []
+    if args.clear_tests:
+        updates["tests"] = None
+    if args.clear_parallel_group:
+        updates["parallel_group"] = None
+    if not updates:
+        print("Error: nothing to edit; pass at least one field")
+        return 1
+
+    lock = FileLock(args.todo_file)
+    with lock:
+        report_lock(lock)
+        data = load_todo(args.todo_file)
+        _, task = find_task(data, args.task_id)
+        if task is None:
+            print(f"Error: task {args.task_id} not found")
+            return 1
+        if args.task_id in updates.get("prerequisites", []):
+            print(f"Error: task {args.task_id} cannot require itself")
+            return 1
+        for dep in updates.get("prerequisites", []):
+            if find_task(data, dep)[1] is None:
+                print(f"Error: prerequisite {dep} does not exist")
+                return 1
+        before, _ = semantic_errors(data)
+        edit_task(data, args.task_id, **updates)
+        after, _ = semantic_errors(data)
+        introduced = [e for e in after if e not in before]
+        if introduced:
+            print(f"Error: edit rejected: {'; '.join(introduced)}")
+            return 1
+        save_todo(data, args.todo_file)
+        record_event(args.todo_file, "edit", task=args.task_id,
+                     owner=args.owner or default_owner(), fields=sorted(updates))
+    print(f"✓ Edited task {args.task_id}: {', '.join(sorted(updates))}")
+    return 0
+
+
 def cmd_add_phase(args) -> int:
     if not PHASE_ID_RE.match(args.phase):
         print(f"Error: invalid phase id {args.phase} (want MAJOR.MINOR, e.g. 7.2)")
@@ -1882,6 +1964,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--success", action="append", metavar="CRITERION",
                    help="Success criterion (repeatable)")
     p.set_defaults(func=cmd_add)
+
+    p = add_owner(add_command("edit", "Change a task's plan fields", task_id=True))
+    p.add_argument("--title", help="New title")
+    p.add_argument("--goal", help="New goal")
+    p.add_argument("--complexity", choices=["Low", "Medium", "High", "Very High"])
+    p.add_argument("--agent", choices=["basic_dev_agent", "mid_dev_agent", "pro_dev_agent", "flagship"])
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--touches", action="append", metavar="PATH",
+                       help="Owned path (repeatable; replaces the whole list)")
+    group.add_argument("--clear-touches", action="store_true", help="Clear owned paths")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--success", action="append", metavar="CRITERION",
+                       help="Success criterion (repeatable; replaces the whole list)")
+    group.add_argument("--clear-success", action="store_true", help="Clear success criteria")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--prereq", action="append", metavar="TASK_ID",
+                       help="Prerequisite task ID (repeatable; replaces the whole list)")
+    group.add_argument("--clear-prereq", action="store_true", help="Drop every prerequisite")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--tests", help="Command that verifies the task")
+    group.add_argument("--clear-tests", action="store_true", help="Remove the tests field")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--parallel-group", dest="parallel_group", help="Parallel group name")
+    group.add_argument("--clear-parallel-group", action="store_true",
+                       help="Remove the parallel group label")
+    p.set_defaults(func=cmd_edit)
 
     p = add_command("add-phase", "Insert a new phase")
     p.add_argument("--phase", required=True, help="New phase ID (MAJOR.MINOR, e.g. 7.2)")

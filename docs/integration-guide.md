@@ -284,7 +284,7 @@ with `TIDETABLE_EVENTS=0`.
 and the read-only dashboard. It is the single writer: GET routes
 (`ready`, `next`, `list`, `deps`, `history`, `look-queue`, `validate`, `parallel`) call the
 CLI functions and return the `--json` shapes; POST routes (`start`, `done`,
-`reset`, `status`, `add`, `add-phase`, `look-defer`, `look-clear`) hold a server lock plus
+`reset`, `status`, `add`, `add-phase`, `edit`, `look-defer`, `look-clear`) hold a server lock plus
 `FileLock`, reload inside the lock, and enforce claim leases. `look-clear` takes a
 `reject` body flag (`tidetable look-clear SLUG ID --reject` over `--server`) to send the
 task back to `pending` instead of `done`. `POST /api/<slug>/heartbeat` records agent
@@ -493,6 +493,25 @@ tidetable add my-todo.json --phase 7.1 \
 
 The new ID is the phase's highest sequence number plus one. Unknown
 prerequisites are rejected rather than written.
+
+### Editing a Task
+
+```bash
+tidetable edit my-todo.json 7.1.1 \
+  --title "Add structured logging" \
+  --success "Logs include level and timestamp" \
+  --tests "cargo test --quiet"
+tidetable edit my-todo.json 7.1.1 --clear-parallel-group
+```
+
+Only the fields named on the command line change; status and claims are never
+touched, and `updated_at` moves. List flags (`--prereq`, `--touches`,
+`--success`) replace the whole list, and `--clear-touches`, `--clear-success`,
+`--clear-prereq`, `--clear-tests`, `--clear-parallel-group` empty or remove one.
+A dangling prerequisite, a self-prerequisite or a cycle is refused and nothing
+is written. The edit is recorded as one `edit` event carrying the changed field
+names. Over HTTP: `POST /api/<slug>/edit` with `task` plus the same field names;
+a JSON `null` clears a list or an optional scalar.
 
 ### Adding Phases
 

@@ -316,6 +316,87 @@ class AddTest(unittest.TestCase):
             self.assertEqual(reload(path)["phases"][0]["tasks"][-1]["id"], "1.0.1")
 
 
+class EditTest(unittest.TestCase):
+    def test_edit_changes_only_named_fields_and_keeps_claims(self):
+        with TempTodo(todo(phase(
+            "1.0",
+            task("1.0.1", status="in_progress", goal="old", touches=["old/"],
+                 claimed_by="a", claimed_at="2026-10-17T00:00:00Z",
+                 lease_expires_at="2026-10-17T01:00:00Z"),
+            task("1.0.2"),
+        ))) as path:
+            code, out = run("edit", path, "1.0.1",
+                            "--title", "Better", "--goal", "new goal",
+                            "--touches", "a/", "--touches", "b/",
+                            "--success", "it works", "--tests", "make test",
+                            "--complexity", "High", "--agent", "flagship",
+                            "--parallel-group", "grp", "--prereq", "1.0.2")
+            self.assertEqual(code, 0, out)
+            edited = reload(path)["phases"][0]["tasks"][0]
+            self.assertEqual(edited["title"], "Better")
+            self.assertEqual(edited["goal"], "new goal")
+            self.assertEqual(edited["touches"], ["a/", "b/"])
+            self.assertEqual(edited["success"], ["it works"])
+            self.assertEqual(edited["tests"], "make test")
+            self.assertEqual(edited["complexity"], "High")
+            self.assertEqual(edited["agent"], "flagship")
+            self.assertEqual(edited["parallel_group"], "grp")
+            self.assertEqual(edited["prerequisites"], ["1.0.2"])
+            self.assertEqual(edited["status"], "in_progress")
+            self.assertEqual(edited["claimed_by"], "a")
+            self.assertEqual(edited["lease_expires_at"], "2026-10-17T01:00:00Z")
+            self.assertTrue(edited["updated_at"].endswith("Z"))
+
+    def test_clear_flags_empty_lists_and_remove_optional_scalars(self):
+        with TempTodo(todo(phase("1.0", task(
+                "1.0.1", prerequisites=["1.0.2"], touches=["x/"],
+                success=["ok"], tests="make", parallel_group="grp"),
+                task("1.0.2")))) as path:
+            code, out = run("edit", path, "1.0.1", "--clear-touches",
+                            "--clear-success", "--clear-prereq",
+                            "--clear-tests", "--clear-parallel-group")
+            self.assertEqual(code, 0, out)
+            task_out = reload(path)["phases"][0]["tasks"][0]
+            self.assertEqual(task_out["touches"], [])
+            self.assertEqual(task_out["success"], [])
+            self.assertEqual(task_out["prerequisites"], [])
+            self.assertNotIn("tests", task_out)
+            self.assertNotIn("parallel_group", task_out)
+
+    def test_nothing_to_edit_is_an_error(self):
+        with TempTodo(todo(phase("1.0", task("1.0.1")))) as path:
+            code, out = run("edit", path, "1.0.1")
+            self.assertEqual(code, 1)
+            self.assertIn("nothing to edit", out)
+
+    def test_dangling_or_self_prerequisite_is_refused_without_writing(self):
+        with TempTodo(todo(phase("1.0", task("1.0.1"), task("1.0.2")))) as path:
+            code, out = run("edit", path, "1.0.1", "--title", "Nope",
+                            "--prereq", "9.9.9")
+            self.assertEqual(code, 1)
+            self.assertIn("does not exist", out)
+            self.assertEqual(reload(path)["phases"][0]["tasks"][0]["title"], "Task 1.0.1")
+            code, out = run("edit", path, "1.0.1", "--prereq", "1.0.1")
+            self.assertEqual(code, 1)
+            self.assertIn("cannot require itself", out)
+
+    def test_a_prerequisite_cycle_is_refused(self):
+        with TempTodo(todo(phase("1.0", task("1.0.1", prerequisites=["1.0.2"]),
+                                 task("1.0.2")))) as path:
+            code, out = run("edit", path, "1.0.2", "--prereq", "1.0.1")
+            self.assertEqual(code, 1)
+            self.assertIn("cycle", out.lower())
+            self.assertNotIn("prerequisites", reload(path)["phases"][0]["tasks"][1])
+
+    def test_edit_appends_an_event(self):
+        with TempTodo(todo(phase("1.0", task("1.0.1")))) as path:
+            self.assertEqual(run("edit", path, "1.0.1", "--goal", "g2")[0], 0)
+            events = json.loads(run("history", path, "--task", "1.0.1", "--json")[1])["events"]
+            edit = [e for e in events if e.get("event") == "edit"][-1]
+            self.assertEqual(edit["task"], "1.0.1")
+            self.assertEqual(edit["fields"], ["goal"])
+
+
 class AddPhaseTest(unittest.TestCase):
     def test_add_phase_appends_by_default(self):
         with TempTodo(todo(phase("1.0", task("1.0.1")))) as path:
@@ -1871,6 +1952,31 @@ class TestRemoteClient(unittest.TestCase):
             code, _, _ = self.run_cli("list", "demo", server="http://127.0.0.1:1")
         self.assertEqual(code, 1)
 
+    def test_edit_over_the_wire_changes_only_named_fields(self):
+        self.assertEqual(self.run_cli("start", "demo", "1.0.1", "--owner", "w")[0], 0)
+        code, out, _ = self.run_cli("edit", "demo", "1.0.1", "--title", "New",
+                                    "--touches", "src/", "--clear-success")
+        self.assertEqual(code, 0, out)
+        payload = json.loads(out)
+        self.assertEqual(payload["changed"], ["success", "title", "touches"])
+        self.assertEqual(payload["task"]["status"], "in_progress")
+        tasks = {t["id"]: t for t in
+                 json.loads(Path(self.todo_path).read_text(encoding="utf-8"))["phases"][0]["tasks"]}
+        self.assertEqual(tasks["1.0.1"]["title"], "New")
+        self.assertEqual(tasks["1.0.1"]["touches"], ["src/"])
+        self.assertEqual(tasks["1.0.1"]["success"], [])
+        self.assertEqual(tasks["1.0.1"]["claimed_by"], "w")
+
+    def test_edit_refusal_keeps_the_local_wording(self):
+        code, out, err = self.run_cli("edit", "demo", "1.0.1", "--prereq", "9.9.9")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("prerequisite 9.9.9 does not exist", err)
+        local = io.StringIO()
+        with redirect_stdout(local):
+            self.assertEqual(
+                cli.main(["edit", self.todo_path, "1.0.1", "--prereq", "9.9.9"]), 1)
+        self.assertIn("prerequisite 9.9.9 does not exist", local.getvalue())
+
     def test_add_phase_over_the_wire(self):
         code, out, _ = self.run_cli("add-phase", "demo", "--phase", "2.0",
                                     "--title", "Next", "--prereq", "1.0", "--after", "1.0")
@@ -1937,6 +2043,16 @@ class TestRemoteClient(unittest.TestCase):
             ["add", "demo", "--phase", "1.0", "--title", "T", "--prereq", "a", "--prereq", "b"])
         _, _, body = remote.build_request(args)
         self.assertEqual(body["prerequisites"], ["a", "b"])
+        args = cli.build_parser().parse_args(
+            ["edit", "demo", "1.0.1", "--title", "T", "--touches", "a/",
+             "--clear-success", "--clear-tests"])
+        method, path, body = remote.build_request(args)
+        self.assertEqual((method, path), ("POST", "/api/demo/edit"))
+        self.assertEqual(body["task"], "1.0.1")
+        self.assertEqual(body["title"], "T")
+        self.assertEqual(body["touches"], ["a/"])
+        self.assertIsNone(body["success"])
+        self.assertIsNone(body["tests"])
         args = cli.build_parser().parse_args(
             ["look-defer", "demo", "1.0.1", "--note", "check it"])
         method, path, body = remote.build_request(args)

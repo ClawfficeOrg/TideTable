@@ -42,6 +42,7 @@ ROUTES = {
     "status": ("POST", "status"),
     "add": ("POST", "add"),
     "add-phase": ("POST", "add-phase"),
+    "edit": ("POST", "edit"),
     "look-defer": ("POST", "look-defer"),
     "look-clear": ("POST", "look-clear"),
 }
@@ -129,6 +130,23 @@ def build_request(args) -> tuple[str, str, dict]:
                            ("after", args.after), ("before", args.before)):
             if value:
                 body[key] = value
+    elif cmd == "edit":
+        body = {"task": args.task_id, "owner": _owner(args), **extras}
+        for key in ("title", "goal", "tests", "complexity", "agent", "parallel_group"):
+            value = getattr(args, key)
+            if value is not None:
+                body[key] = value
+        for key, values in (("touches", args.touches), ("success", args.success),
+                            ("prerequisites", args.prereq)):
+            if values is not None:
+                body[key] = values
+        for key, flag in (("touches", args.clear_touches),
+                          ("success", args.clear_success),
+                          ("prerequisites", args.clear_prereq),
+                          ("tests", args.clear_tests),
+                          ("parallel_group", args.clear_parallel_group)):
+            if flag:
+                body[key] = None
     elif cmd == "look-defer":
         body = {"task": args.task_id, "owner": _owner(args), **extras}
         if args.note is not None:

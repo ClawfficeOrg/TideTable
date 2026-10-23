@@ -54,6 +54,7 @@ and is never defaulted.
 | `parallel <file>` | Parallel groups, marking which members are runnable now |
 | `deps <file> <id>` | What a task waits on and what it unblocks |
 | `add <file> --phase <id> --title <t>` | Append a task. Accepts `--goal`, `--prereq` (repeatable), `--complexity`, `--agent`, `--parallel-group`, `--touches`, `--success` |
+| `edit <file> <id> [flags]` | Change a task's plan fields (`--title`, `--goal`, `--prereq`, `--complexity`, `--agent`, `--parallel-group`, `--touches`, `--success`, `--tests`) and clear lists with `--clear-touches`/`--clear-success`/`--clear-prereq`/`--clear-tests`/`--clear-parallel-group`. Never touches status or claims; a dangling or cyclic prerequisite is refused. Also `POST /api/<slug>/edit` |
 | `add-phase <file> --phase <id> --title <t>` | Insert a phase (`--goal`, `--prereq` repeatable phase IDs, `--after`/`--before` anchor; also `POST /api/<slug>/add-phase`) |
 | `release <file> [phase]` | The tag a completed phase ships as. Prints it by default; `--tag` actually creates it |
 | `history <file>` | Replay the append-only event log. `--task <id>` filters, `--limit N` tails |

@@ -57,6 +57,7 @@ ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/api/{slug}/status"): "cmd_status",
     ("POST", "/api/{slug}/add"): "cmd_add",
     ("POST", "/api/{slug}/add-phase"): "cmd_add_phase",
+    ("POST", "/api/{slug}/edit"): "cmd_edit",
     ("POST", "/api/{slug}/look-defer"): "cmd_look_defer",
     ("POST", "/api/{slug}/look-clear"): "cmd_look_clear",
     ("POST", "/api/{slug}/heartbeat"): "heartbeat",
@@ -1035,6 +1036,71 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                     "from": cli.LOOK,
                     "to": target,
                 }
+
+    if route == "/api/{slug}/edit":
+        task_id = str(data_in.get("task") or data_in.get("task_id")
+                      or data_in.get("id") or "").strip()
+        if not task_id:
+            return 400, {"error": "missing task=<id>"}
+        updates: dict = {}
+        for key in ("title", "goal", "tests", "complexity", "agent"):
+            if key in data_in:
+                updates[key] = data_in[key]
+        if "parallel_group" in data_in or "parallelGroup" in data_in:
+            updates["parallel_group"] = data_in.get(
+                "parallel_group", data_in.get("parallelGroup"))
+        for key, aliases in (("touches", ("touches",)),
+                             ("success", ("success",)),
+                             ("prerequisites", ("prerequisites", "prereq"))):
+            for alias in aliases:
+                if alias not in data_in:
+                    continue
+                value = data_in[alias]
+                if value is None:
+                    updates[key] = []
+                elif isinstance(value, str):
+                    updates[key] = [value]
+                elif isinstance(value, list):
+                    updates[key] = value
+                else:
+                    return 400, {"error": f"{key} must be a list of strings"}
+                break
+        if not updates:
+            return 400, {"error": "nothing to edit; pass at least one field"}
+        if "title" in updates and not _text(updates["title"]):
+            return 400, {"error": "title cannot be empty"}
+        if "complexity" in updates and updates["complexity"] not in (
+                "Low", "Medium", "High", "Very High"):
+            return 400, {"error": f"invalid complexity: {updates['complexity']}"}
+        if "agent" in updates and updates["agent"] not in (
+                "basic_dev_agent", "mid_dev_agent", "pro_dev_agent", "flagship"):
+            return 400, {"error": f"invalid agent: {updates['agent']}"}
+        with _WRITE_LOCK:
+            with FileLock(todo_path):
+                data = cli.load_todo(todo_path)
+                _, task = cli.find_task(data, task_id)
+                if task is None:
+                    return 404, {"error": f"task {task_id} not found"}
+                if task_id in updates.get("prerequisites", []):
+                    return 400, {"error": f"task {task_id} cannot require itself"}
+                for dep in updates.get("prerequisites", []):
+                    if cli.find_task(data, dep)[1] is None:
+                        return 404, {"error": f"prerequisite {dep} does not exist"}
+                before, _ = cli.semantic_errors(data)
+                cli.edit_task(data, task_id, **updates)
+                after, _ = cli.semantic_errors(data)
+                introduced = [e for e in after if e not in before]
+                if introduced:
+                    return 422, {"error": "; ".join(introduced)}
+                cli.save_todo(data, todo_path)
+                cli.record_event(todo_path, "edit", task=task_id, owner=owner,
+                                 fields=sorted(updates), **extras)
+                tiers = cli.resolved_tiers(data, todo_path)
+                return 200, {
+                    "task": cli.task_summary(task, tiers),
+                    "changed": sorted(updates),
+                }
+
 
     return 404, {"error": f"unknown route: {route}"}
 

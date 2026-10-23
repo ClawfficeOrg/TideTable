@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`tidetable edit <file> <id>`** changed a task's plan fields without hand-editing JSON: `--title`, `--goal`, `--tests`, `--complexity`, `--agent`, `--parallel-group`, repeatable `--prereq`/`--touches`/`--success` that replace the whole list, and the matching `--clear-*` flags. Status and claims were never touched; dangling, self or cyclic prerequisites were refused and nothing was written. Every edit appended one `edit` event. Also `POST /api/<slug>/edit` and `tidetable --server`.
 - Hub routes `POST /api/<slug>/look-defer` and `look-clear`, and `tidetable --server` support for both (`look-clear --reject` sends the task back to pending).
 
 ### Fixed
