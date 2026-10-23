@@ -57,6 +57,8 @@ ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/api/{slug}/status"): "cmd_status",
     ("POST", "/api/{slug}/add"): "cmd_add",
     ("POST", "/api/{slug}/add-phase"): "cmd_add_phase",
+    ("POST", "/api/{slug}/look-defer"): "cmd_look_defer",
+    ("POST", "/api/{slug}/look-clear"): "cmd_look_clear",
     ("POST", "/api/{slug}/heartbeat"): "heartbeat",
 }
 
@@ -972,6 +974,67 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                 event_fields.update(extras)
                 cli.record_event(todo_path, "add-phase", **event_fields)
                 return 200, {"phase": phase, "id": phase["id"]}
+
+    if route == "/api/{slug}/look-defer":
+        task_id = str(data_in.get("task") or data_in.get("task_id")
+                      or data_in.get("id") or "").strip()
+        if not task_id:
+            return 400, {"error": "missing task=<id>"}
+        note = _text(data_in.get("note"))
+        with _WRITE_LOCK:
+            with FileLock(todo_path):
+                data = cli.load_todo(todo_path)
+                _, task = cli.find_task(data, task_id)
+                if task is None:
+                    return 404, {"error": f"task {task_id} not found"}
+                previous = task.get("status")
+                if previous == "done":
+                    return 200, {
+                        "task": task_id,
+                        "already_done": True,
+                        "from": previous,
+                        "to": previous,
+                    }
+                cli.set_status(data, task_id, cli.LOOK)
+                task["human_look"] = note or task.get("human_look", "")
+                cli.save_todo(data, todo_path)
+                cli.record_event(todo_path, "look_defer", task=task_id, owner=owner,
+                                 **{"from": previous, "to": cli.LOOK}, note=note,
+                                 **extras)
+                return 200, {
+                    "task": task_id,
+                    "from": previous,
+                    "to": cli.LOOK,
+                    "note": task["human_look"],
+                }
+
+    if route == "/api/{slug}/look-clear":
+        task_id = str(data_in.get("task") or data_in.get("task_id")
+                      or data_in.get("id") or "").strip()
+        if not task_id:
+            return 400, {"error": "missing task=<id>"}
+        reject = _body_truthy(data_in.get("reject"))
+        with _WRITE_LOCK:
+            with FileLock(todo_path):
+                data = cli.load_todo(todo_path)
+                _, task = cli.find_task(data, task_id)
+                if task is None:
+                    return 404, {"error": f"task {task_id} not found"}
+                if task.get("status") != cli.LOOK:
+                    return 409, {
+                        "error": f"task {task_id} is {task.get('status')}, not {cli.LOOK}",
+                    }
+                target = "pending" if reject else "done"
+                cli.set_status(data, task_id, target)
+                task.pop("human_look", None)
+                cli.save_todo(data, todo_path)
+                cli.record_event(todo_path, "look_clear", task=task_id, owner=owner,
+                                 **{"from": cli.LOOK, "to": target}, **extras)
+                return 200, {
+                    "task": task_id,
+                    "from": cli.LOOK,
+                    "to": target,
+                }
 
     return 404, {"error": f"unknown route: {route}"}
 

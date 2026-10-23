@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Hub routes `POST /api/<slug>/look-defer` and `look-clear`, and `tidetable --server` support for both (`look-clear --reject` sends the task back to pending).
+
 ### Fixed
 
 - **Hub writes carry a base and a stale one is refused.** `POST /api/<slug>/start`, `/done`, `/reset` and `/status` took a `base` (the hub's event count when the caller decided) and answered `409 {"conflict": true, "task", "base", "current"}` when that task changed after it, without applying the write. A duplicate `done` still returned `already_done`.

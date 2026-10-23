@@ -284,8 +284,10 @@ with `TIDETABLE_EVENTS=0`.
 and the read-only dashboard. It is the single writer: GET routes
 (`ready`, `next`, `list`, `deps`, `history`, `look-queue`, `validate`, `parallel`) call the
 CLI functions and return the `--json` shapes; POST routes (`start`, `done`,
-`reset`, `status`, `add`) hold a server lock plus `FileLock`, reload inside
-the lock, and enforce claim leases. `POST /api/<slug>/heartbeat` records agent
+`reset`, `status`, `add`, `add-phase`, `look-defer`, `look-clear`) hold a server lock plus
+`FileLock`, reload inside the lock, and enforce claim leases. `look-clear` takes a
+`reject` body flag (`tidetable look-clear SLUG ID --reject` over `--server`) to send the
+task back to `pending` instead of `done`. `POST /api/<slug>/heartbeat` records agent
 presence (repo, branch, task) with a 180s staleness horizon, and
 `GET /api/stream` replays the event log as SSE. Auth is a shared
 `TK_API_TOKEN` bearer today, per-project machine tokens
@@ -356,8 +358,10 @@ exported server) reads the same routes as `tidetable --server`, plus
 every 2 s, and the footer shows `✓ live` or `· polling`. If the hub drops, the last data
 stays on screen dimmed with `⊘ offline · retry Ns · data Nm old`, and retries back off
 2, 4, 8, 16, 30 s. The token only travels in the `Authorization` header and is never shown,
-logged or stored. Over the hub only `d` is available; clear, reject and defer have no hub
-route yet. Local mode refreshes when the todo or its `.events.jsonl` changes, else every 5 s.
+logged or stored. Over the hub only `d` is available; clear, reject and defer are not wired
+into the TUI client yet, even though the hub now has `look-defer`/`look-clear` routes
+(`tidetable --server` can call them). Local mode refreshes when the todo or its
+`.events.jsonl` changes, else every 5 s.
 
 **Palettes.** `--palette NAME` or `$TIDETABLE_PALETTE`: `biolume` (default), `deep-tide`,
 `sea-glass`, `phosphor`, `boiled`, vendored from clawffice-design. Colour depth falls

@@ -42,6 +42,8 @@ ROUTES = {
     "status": ("POST", "status"),
     "add": ("POST", "add"),
     "add-phase": ("POST", "add-phase"),
+    "look-defer": ("POST", "look-defer"),
+    "look-clear": ("POST", "look-clear"),
 }
 
 #: writes that carry a base: the hub event count the caller decided against.
@@ -127,6 +129,13 @@ def build_request(args) -> tuple[str, str, dict]:
                            ("after", args.after), ("before", args.before)):
             if value:
                 body[key] = value
+    elif cmd == "look-defer":
+        body = {"task": args.task_id, "owner": _owner(args), **extras}
+        if args.note is not None:
+            body["note"] = args.note
+    elif cmd == "look-clear":
+        body = {"task": args.task_id, "owner": _owner(args),
+                "reject": bool(args.reject), **extras}
 
     if cmd in BASED and getattr(args, "base", None) is not None:
         body["base"] = args.base

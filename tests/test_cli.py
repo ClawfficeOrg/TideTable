@@ -400,6 +400,88 @@ class AddPhaseTest(unittest.TestCase):
                 {"phase": "1.1", "title": "Dup"}, registry, db)
             self.assertEqual(dup, 409)
 
+
+class LookHubTest(unittest.TestCase):
+    """serve.py's POST look-defer/look-clear routes, unit-level."""
+
+    def _setup(self, tmp, data):
+        todo_path = str(Path(tmp) / "todo.json")
+        Path(todo_path).write_text(json.dumps(data), encoding="utf-8")
+        registry = str(Path(tmp) / "registry.json")
+        Path(registry).write_text(json.dumps({"projects": [
+            {"slug": "demo", "name": "Demo", "repo_url": "",
+             "todo_path": todo_path, "default_branch": "main"},
+        ]}), encoding="utf-8")
+        db = str(Path(tmp) / "sessions.db")
+        return todo_path, registry, db
+
+    def test_look_defer_queues_task_and_keeps_note(self):
+        with TemporaryDirectory() as tmp:
+            todo_path, registry, db = self._setup(
+                tmp, todo(phase("1.0", task("1.0.1", "in_progress"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-defer", "demo",
+                {"task": "1.0.1", "note": "check it", "owner": "agent"},
+                registry, db)
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["to"], "needs_human_look")
+            data = json.loads(Path(todo_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["phases"][0]["tasks"][0]["status"], "needs_human_look")
+            self.assertEqual(data["phases"][0]["tasks"][0]["human_look"], "check it")
+
+    def test_look_defer_already_done_is_a_no_op(self):
+        with TemporaryDirectory() as tmp:
+            todo_path, registry, db = self._setup(
+                tmp, todo(phase("1.0", task("1.0.1", "done"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-defer", "demo", {"task": "1.0.1"}, registry, db)
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["already_done"])
+            data = json.loads(Path(todo_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["phases"][0]["tasks"][0]["status"], "done")
+
+    def test_look_defer_missing_task_is_404(self):
+        with TemporaryDirectory() as tmp:
+            _, registry, db = self._setup(tmp, todo(phase("1.0", task("1.0.1"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-defer", "demo", {"task": "9.9.9"}, registry, db)
+            self.assertEqual(status, 404)
+            self.assertEqual(payload["error"], "task 9.9.9 not found")
+
+    def test_look_clear_marks_done_and_drops_note(self):
+        with TemporaryDirectory() as tmp:
+            todo_path, registry, db = self._setup(
+                tmp, todo(phase("1.0", task("1.0.1", "needs_human_look",
+                                           human_look="check it"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-clear", "demo", {"task": "1.0.1"}, registry, db)
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["to"], "done")
+            data = json.loads(Path(todo_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["phases"][0]["tasks"][0]["status"], "done")
+            self.assertNotIn("human_look", data["phases"][0]["tasks"][0])
+
+    def test_look_clear_reject_returns_to_pending(self):
+        with TemporaryDirectory() as tmp:
+            todo_path, registry, db = self._setup(
+                tmp, todo(phase("1.0", task("1.0.1", "needs_human_look"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-clear", "demo", {"task": "1.0.1", "reject": True},
+                registry, db)
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["to"], "pending")
+            data = json.loads(Path(todo_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["phases"][0]["tasks"][0]["status"], "pending")
+
+    def test_look_clear_refuses_task_not_in_queue(self):
+        with TemporaryDirectory() as tmp:
+            _, registry, db = self._setup(tmp, todo(phase("1.0", task("1.0.1"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-clear", "demo", {"task": "1.0.1"}, registry, db)
+            self.assertEqual(status, 409)
+            self.assertEqual(payload["error"], "task 1.0.1 is pending, not needs_human_look")
+
+
 class OutputTest(unittest.TestCase):
     def test_next_json_is_parseable(self):
         with TempTodo(todo(phase("1.0", task("1.0.1")))) as path:
@@ -1616,6 +1698,7 @@ class TestRemoteClient(unittest.TestCase):
         server.registry = registry
         server.sessions_db = str(root / "sessions.db")
         server.tokens_db = str(root / "tokens.db")
+        self.tokens_db = server.tokens_db
         self.thread = threading.Thread(target=server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(server.server_close)
@@ -1658,6 +1741,78 @@ class TestRemoteClient(unittest.TestCase):
             cli.main(["look-queue", self.todo_path, "--json"])
         self.assertEqual(json.loads(out), json.loads(local.getvalue()))
         self.assertEqual([q["id"] for q in json.loads(out)["queue"]], ["1.0.1"])
+
+    def test_look_defer_then_clear_matches_local_effect(self):
+        local_copy = str(Path(self.tmp.name) / "local.json")
+        Path(local_copy).write_text(
+            Path(self.todo_path).read_text(encoding="utf-8"), encoding="utf-8")
+
+        code, out, _ = self.run_cli("look-defer", "demo", "1.0.1", "--note", "check it")
+        self.assertEqual(code, 0, out)
+        run("look-defer", local_copy, "1.0.1", "--note", "check it")
+
+        hub = reload(self.todo_path)["phases"][0]["tasks"][0]
+        local = reload(local_copy)["phases"][0]["tasks"][0]
+        self.assertEqual(hub["status"], local["status"])
+        self.assertEqual(hub["status"], "needs_human_look")
+        self.assertEqual(hub["human_look"], local["human_look"])
+
+        code, out, _ = self.run_cli("look-clear", "demo", "1.0.1")
+        self.assertEqual(code, 0, out)
+        run("look-clear", local_copy, "1.0.1")
+
+        hub = reload(self.todo_path)["phases"][0]["tasks"][0]
+        local = reload(local_copy)["phases"][0]["tasks"][0]
+        self.assertEqual(hub["status"], "done")
+        self.assertEqual(local["status"], "done")
+        self.assertNotIn("human_look", hub)
+        self.assertNotIn("human_look", local)
+
+    def test_look_clear_reject_matches_local_effect(self):
+        data = reload(self.todo_path)
+        data["phases"][0]["tasks"][0]["status"] = "needs_human_look"
+        data["phases"][0]["tasks"][0]["human_look"] = "check it"
+        Path(self.todo_path).write_text(json.dumps(data), encoding="utf-8")
+        local_copy = str(Path(self.tmp.name) / "local-reject.json")
+        Path(local_copy).write_text(json.dumps(data), encoding="utf-8")
+
+        code, out, _ = self.run_cli("look-clear", "demo", "1.0.1", "--reject")
+        self.assertEqual(code, 0, out)
+        run("look-clear", local_copy, "1.0.1", "--reject")
+
+        hub = reload(self.todo_path)["phases"][0]["tasks"][0]
+        local = reload(local_copy)["phases"][0]["tasks"][0]
+        self.assertEqual(hub["status"], "pending")
+        self.assertEqual(local["status"], "pending")
+
+    def test_look_clear_refusal_matches_local_wording(self):
+        # 1.0.1 is plain "pending", not queued for a human look.
+        code, out, err = self.run_cli("look-clear", "demo", "1.0.1")
+        self.assertEqual(code, 1)
+        local_code, local_out = run("look-clear", self.todo_path, "1.0.1")
+        self.assertEqual(local_code, 1)
+        self.assertIn(local_out.strip(), err)
+
+    def test_look_defer_not_found_matches_local_wording(self):
+        code, out, err = self.run_cli("look-defer", "demo", "9.9.9")
+        self.assertEqual(code, 1)
+        local_code, local_out = run("look-defer", self.todo_path, "9.9.9")
+        self.assertEqual(local_code, 1)
+        self.assertIn(local_out.strip(), err)
+
+    def test_look_defer_auth_401_and_403(self):
+        from tidetable import tokens as tokens_store
+
+        code, out, err = self.run_cli("look-defer", "demo", "1.0.1", token="")
+        self.assertEqual(code, 1)
+        self.assertIn("unauthorized", err)
+        self.assertEqual(reload(self.todo_path)["phases"][0]["tasks"][0]["status"], "pending")
+
+        _, presented, _ = tokens_store.mint_token(self.tokens_db, ["other"], ["read", "write"])
+        code, out, err = self.run_cli("look-defer", "demo", "1.0.1", token=presented)
+        self.assertEqual(code, 1)
+        self.assertIn("forbidden", err)
+        self.assertEqual(reload(self.todo_path)["phases"][0]["tasks"][0]["status"], "pending")
 
     def test_sidebar_matches_local_json_and_renders_text_without_it(self):
         code, out, _ = self.run_cli("sidebar", "demo", "--json", "--width", "60", "--height", "20")
@@ -1782,3 +1937,15 @@ class TestRemoteClient(unittest.TestCase):
             ["add", "demo", "--phase", "1.0", "--title", "T", "--prereq", "a", "--prereq", "b"])
         _, _, body = remote.build_request(args)
         self.assertEqual(body["prerequisites"], ["a", "b"])
+        args = cli.build_parser().parse_args(
+            ["look-defer", "demo", "1.0.1", "--note", "check it"])
+        method, path, body = remote.build_request(args)
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/api/demo/look-defer")
+        self.assertEqual(body["task"], "1.0.1")
+        self.assertEqual(body["note"], "check it")
+        args = cli.build_parser().parse_args(["look-clear", "demo", "1.0.1", "--reject"])
+        method, path, body = remote.build_request(args)
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/api/demo/look-clear")
+        self.assertIs(body["reject"], True)
