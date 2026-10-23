@@ -1918,8 +1918,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--changelog", help="Changelog line for this task")
     p.set_defaults(func=cmd_done)
 
-    p = add_owner(add_command("look-defer", "Queue a task for a human look (counts as done)",
-                              task_id=True))
+    p = add_base(add_owner(add_command("look-defer", "Queue a task for a human look (counts as done)",
+                                       task_id=True)))
     p.add_argument("--note", help="What the human should check")
     p.set_defaults(func=cmd_look_defer)
 
@@ -1928,7 +1928,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="List each task's success criteria as a checklist")
     p.set_defaults(func=cmd_look_queue)
 
-    p = add_owner(add_command("look-clear", "A human looked: task -> done", task_id=True))
+    p = add_base(add_owner(add_command("look-clear", "A human looked: task -> done", task_id=True)))
     p.add_argument("--reject", action="store_true", help="The check failed: back to pending")
     p.set_defaults(func=cmd_look_clear)
 
@@ -1965,7 +1965,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Success criterion (repeatable)")
     p.set_defaults(func=cmd_add)
 
-    p = add_owner(add_command("edit", "Change a task's plan fields", task_id=True))
+    p = add_base(add_owner(add_command("edit", "Change a task's plan fields", task_id=True)))
     p.add_argument("--title", help="New title")
     p.add_argument("--goal", help="New goal")
     p.add_argument("--complexity", choices=["Low", "Medium", "High", "Very High"])

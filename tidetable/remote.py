@@ -48,7 +48,7 @@ ROUTES = {
 }
 
 #: writes that carry a base: the hub event count the caller decided against.
-BASED = {"start", "done", "reset", "status"}
+BASED = {"start", "done", "reset", "status", "edit", "look-defer", "look-clear"}
 
 #: commands that take a todo file but have no hub route.
 LOCAL_ONLY = {"convert", "release"}

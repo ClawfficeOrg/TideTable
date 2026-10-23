@@ -1517,6 +1517,112 @@ class TestHubBase(unittest.TestCase):
         self.assertEqual(self.statuses()["1.0.1"], "in_progress")
         self.assertEqual(len(self.get("conflicts")[1]["conflicts"]), 1)
 
+    def tasks(self) -> dict:
+        return {t["id"]: t for t in reload(self.todo_path)["phases"][0]["tasks"]}
+
+    def test_stale_base_edit_is_rejected_and_recorded(self):
+        seen = self.base()
+        self.assertEqual(self.post("edit", {"task": "1.0.1", "owner": "a", "title": "A"})[0], 200)
+        status, payload = self.post("edit", {"task": "1.0.1", "owner": "b", "title": "B",
+                                             "touches": None, "base": seen})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"conflict": True, "task": "1.0.1", "base": 0, "current": 1})
+        self.assertEqual(self.tasks()["1.0.1"]["title"], "A")
+        self.assertEqual(len(cli.read_events(self.todo_path)), 1)
+        conflicts = self.get("conflicts")[1]["conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        entry = conflicts[0]
+        self.assertEqual((entry["route"], entry["task"], entry["owner"], entry["base"],
+                          entry["current"]), ("edit", "1.0.1", "b", 0, 1))
+        self.assertEqual(entry["changed_by"][0]["event"], "edit")
+        # A null is a --clear-* to edit; the record must still show it.
+        self.assertIn("touches", entry["request"])
+        self.assertIsNone(entry["request"]["touches"])
+
+    def test_current_base_edit_succeeds(self):
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        status, payload = self.post("edit", {"task": "1.0.1", "owner": "a", "title": "New",
+                                             "base": self.base()})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["changed"], ["title"])
+        self.assertEqual(self.tasks()["1.0.1"]["title"], "New")
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_bad_base_on_edit_and_look_is_a_400(self):
+        for route in ("edit", "look-defer", "look-clear"):
+            status, _ = self.post(route, {"task": "1.0.1", "owner": "a", "title": "X",
+                                          "base": "x"})
+            self.assertEqual(status, 400, route)
+        self.assertEqual(self.statuses()["1.0.1"], "pending")
+
+    def test_edit_and_look_without_a_base_behave_like_start(self):
+        # start/done/status skip the check when no base is sent; so do these.
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        self.assertEqual(self.post("edit", {"task": "1.0.1", "owner": "a", "goal": "g"})[0], 200)
+        self.assertEqual(self.post("look-defer", {"task": "1.0.1", "owner": "a"})[0], 200)
+        self.assertEqual(self.post("look-clear", {"task": "1.0.1", "owner": "a"})[0], 200)
+        self.assertEqual(self.statuses()["1.0.1"], "done")
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_stale_base_look_defer_is_rejected_and_recorded(self):
+        seen = self.base()
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        status, payload = self.post("look-defer", {"task": "1.0.1", "owner": "b",
+                                                   "note": "eyeball", "base": seen})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"conflict": True, "task": "1.0.1", "base": 0, "current": 1})
+        self.assertEqual(self.statuses()["1.0.1"], "in_progress")
+        self.assertNotIn("human_look", self.tasks()["1.0.1"])
+        conflicts = self.get("conflicts")[1]["conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual((conflicts[0]["route"], conflicts[0]["owner"],
+                          conflicts[0]["request"]["note"]), ("look-defer", "b", "eyeball"))
+
+    def test_stale_base_look_clear_is_rejected_and_recorded(self):
+        seen = self.base()
+        self.post("look-defer", {"task": "1.0.1", "owner": "a", "note": "check it"})
+        for reject in (False, True):
+            status, payload = self.post("look-clear", {"task": "1.0.1", "owner": "b",
+                                                       "reject": reject, "base": seen})
+            self.assertEqual(status, 409, reject)
+            self.assertEqual(payload, {"conflict": True, "task": "1.0.1",
+                                       "base": 0, "current": 1})
+        self.assertEqual(self.statuses()["1.0.1"], "needs_human_look")
+        self.assertEqual(self.tasks()["1.0.1"]["human_look"], "check it")
+        conflicts = self.get("conflicts")[1]["conflicts"]
+        self.assertEqual([c["route"] for c in conflicts], ["look-clear", "look-clear"])
+        self.assertEqual(conflicts[0]["changed_by"][0]["event"], "look_defer")
+
+    def test_current_base_look_defer_and_clear_succeed(self):
+        status, payload = self.post("look-defer", {"task": "1.0.1", "owner": "a",
+                                                   "base": self.base()})
+        self.assertEqual((status, payload["to"]), (200, "needs_human_look"))
+        status, payload = self.post("look-clear", {"task": "1.0.1", "owner": "a",
+                                                   "base": self.base()})
+        self.assertEqual((status, payload["to"]), (200, "done"))
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_duplicate_look_clear_keeps_its_plain_409(self):
+        self.post("look-defer", {"task": "1.0.1", "owner": "a"})
+        seen = self.base()
+        self.assertEqual(self.post("look-clear", {"task": "1.0.1", "owner": "a",
+                                                  "base": seen})[0], 200)
+        # The retry's base is now stale, but it is still the old not-in-queue refusal.
+        status, payload = self.post("look-clear", {"task": "1.0.1", "owner": "a", "base": seen})
+        self.assertEqual(status, 409)
+        self.assertNotIn("conflict", payload)
+        self.assertEqual(payload["error"], "task 1.0.1 is done, not needs_human_look")
+        self.assertEqual(self.statuses()["1.0.1"], "done")
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_look_defer_on_a_done_task_stays_a_no_op_with_a_stale_base(self):
+        seen = self.base()
+        self.post("done", {"task": "1.0.1", "owner": "a"})
+        status, payload = self.post("look-defer", {"task": "1.0.1", "owner": "a", "base": seen})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["already_done"])
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
     def test_conflicts_cli_reads_the_list_locally(self):
         seen = self.base()
         self.post("start", {"task": "1.0.1", "owner": "a"})
@@ -1884,15 +1990,16 @@ class TestRemoteClient(unittest.TestCase):
     def test_look_defer_auth_401_and_403(self):
         from tidetable import tokens as tokens_store
 
+        # The base fetch now goes first and refuses as loudly as the write would.
         code, out, err = self.run_cli("look-defer", "demo", "1.0.1", token="")
         self.assertEqual(code, 1)
-        self.assertIn("unauthorized", err)
+        self.assertIn("unauthorized", out + err)
         self.assertEqual(reload(self.todo_path)["phases"][0]["tasks"][0]["status"], "pending")
 
         _, presented, _ = tokens_store.mint_token(self.tokens_db, ["other"], ["read", "write"])
         code, out, err = self.run_cli("look-defer", "demo", "1.0.1", token=presented)
         self.assertEqual(code, 1)
-        self.assertIn("forbidden", err)
+        self.assertIn("forbidden", out + err)
         self.assertEqual(reload(self.todo_path)["phases"][0]["tasks"][0]["status"], "pending")
 
     def test_sidebar_matches_local_json_and_renders_text_without_it(self):
@@ -2006,6 +2113,38 @@ class TestRemoteClient(unittest.TestCase):
         code, out, _ = self.run_cli("conflicts", "demo")
         self.assertEqual(code, 0, out)
         self.assertEqual(json.loads(out)["conflicts"][0]["owner"], "b")
+
+    def test_stale_base_edit_and_look_over_the_wire_are_conflicts(self):
+        self.assertEqual(self.run_cli("start", "demo", "1.0.1", "--owner", "a")[0], 0)
+        for argv in (("edit", "demo", "1.0.1", "--title", "B"),
+                     ("look-defer", "demo", "1.0.1")):
+            code, out, err = self.run_cli(*argv, "--owner", "b", "--base", "0")
+            self.assertEqual(code, 1, argv)
+            self.assertEqual(json.loads(out), {"conflict": True, "task": "1.0.1",
+                                               "base": 0, "current": 1})
+            self.assertIn("conflict", err)
+        # look-clear only reaches the base check for a task in the look queue.
+        self.assertEqual(self.run_cli("look-defer", "demo", "1.0.1", "--owner", "a")[0], 0)
+        code, out, err = self.run_cli("look-clear", "demo", "1.0.1", "--owner", "b",
+                                      "--base", "1")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out), {"conflict": True, "task": "1.0.1",
+                                           "base": 1, "current": 2})
+        self.assertIn("conflict", err)
+        code, out, _ = self.run_cli("conflicts", "demo")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([c["route"] for c in json.loads(out)["conflicts"]],
+                         ["edit", "look-defer", "look-clear"])
+
+    def test_edit_and_look_without_base_fetch_one_and_apply(self):
+        self.assertEqual(self.run_cli("start", "demo", "1.0.1", "--owner", "a")[0], 0)
+        for argv in (("edit", "demo", "1.0.1", "--goal", "g"),
+                     ("look-defer", "demo", "1.0.1"),
+                     ("look-clear", "demo", "1.0.1")):
+            code, out, _ = self.run_cli(*argv, "--owner", "a")
+            self.assertEqual(code, 0, (argv, out))
+        code, out, _ = self.run_cli("conflicts", "demo")
+        self.assertEqual(json.loads(out)["conflicts"], [])
 
     def test_reset_without_base_fetches_one_and_refuses_a_live_claim(self):
         self.assertEqual(self.run_cli("start", "demo", "1.0.1", "--owner", "a")[0], 0)

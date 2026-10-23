@@ -583,7 +583,8 @@ def _parse_base(value: object) -> object:
 
 
 def _stale_base(todo_path: str, route: str, task_id: str, base: int, owner: str,
-                body: Mapping[str, object]) -> tuple[int, dict] | None:
+                body: Mapping[str, object], *,
+                keep_none: bool = False) -> tuple[int, dict] | None:
     """409 when ``task_id`` changed after ``base``; the refusal goes on the conflict list.
 
     Called inside the write lock, so the events read here are the ones the
@@ -591,6 +592,9 @@ def _stale_base(todo_path: str, route: str, task_id: str, base: int, owner: str,
     hub) is a conflict too: the hub cannot vouch for what the writer saw.
     Nothing ever replays a recorded conflict; a person reads the list and
     decides.
+
+    ``keep_none`` keeps null fields in the recorded request: to ``edit`` a
+    null is a ``--clear-*`` and dropping it would misreport what was refused.
     """
     events = cli.read_events(todo_path)
     current = len(events)
@@ -606,7 +610,7 @@ def _stale_base(todo_path: str, route: str, task_id: str, base: int, owner: str,
         "current": current,
         "changed_by": [{k: e.get(k) for k in ("at", "event", "owner", "from", "to")
                         if e.get(k) is not None} for e in since],
-        "request": {k: v for k, v in body.items() if v is not None},
+        "request": {k: v for k, v in body.items() if keep_none or v is not None},
     })
     return 409, {"conflict": True, "task": task_id, "base": base, "current": current}
 
@@ -1026,6 +1030,11 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                         "from": previous,
                         "to": previous,
                     }
+                # After already_done, which writes nothing, as done does.
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
                 cli.set_status(data, task_id, cli.LOOK)
                 task["human_look"] = note or task.get("human_look", "")
                 cli.save_todo(data, todo_path)
@@ -1055,6 +1064,12 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                     return 409, {
                         "error": f"task {task_id} is {task.get('status')}, not {cli.LOOK}",
                     }
+                # After the look check, so a duplicate clear keeps its plain 409
+                # and stays off the conflict list.
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
                 target = "pending" if reject else "done"
                 cli.set_status(data, task_id, target)
                 task.pop("human_look", None)
@@ -1116,6 +1131,11 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                 for dep in updates.get("prerequisites", []):
                     if cli.find_task(data, dep)[1] is None:
                         return 404, {"error": f"prerequisite {dep} does not exist"}
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in,
+                                        keep_none=True)
+                    if stale:
+                        return stale
                 before, _ = cli.semantic_errors(data)
                 cli.edit_task(data, task_id, **updates)
                 after, _ = cli.semantic_errors(data)

@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The TUI stops retrying on a hub 401 or 403 and says what to change (`token rejected · set $TIDETABLE_TOKEN`, `no access to this project`) instead of backing off forever.
 - **Hub writes carry a base and a stale one is refused.** `POST /api/<slug>/start`, `/done`, `/reset` and `/status` took a `base` (the hub's event count when the caller decided) and answered `409 {"conflict": true, "task", "base", "current"}` when that task changed after it, without applying the write. A duplicate `done` still returned `already_done`.
+- **`POST /api/<slug>/edit`, `/look-defer` and `/look-clear` refused a stale base too.** They answered the same `409` conflict, left the task unchanged and appended the refusal to `<todo>.conflicts.jsonl`; a request without a base was still applied, as for start, done and status. `tidetable --server edit`, `look-defer` and `look-clear` took `--base N` and otherwise fetched the base just before the write. A duplicate `look-clear` kept its plain not-in-queue 409.
 - **`POST /api/<slug>/reset` no longer ran blind.** It required a `base` (428 without one) and refused another owner's live claim with a 409 unless `force` was set.
 - `tidetable --server` sent `--base N` when given, else fetched the hub's current base just before the write; `reset --force` reached the hub.
 - The hub drains a POST body (up to 64 KiB) before answering 401/403, so a rejected write no longer surfaces as a connection reset.
