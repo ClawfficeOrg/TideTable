@@ -101,9 +101,12 @@ impl UreqHttp {
                     .ok()
                     .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string));
                 match (code, msg) {
-                    (401 | 403, _) => {
-                        format!("hub refused access (HTTP {code}); set --token or $TIDETABLE_TOKEN")
-                    }
+                    (401, _) => format!(
+                        "{AUTH_401} token rejected (HTTP 401); set --token or $TIDETABLE_TOKEN"
+                    ),
+                    (403, _) => format!(
+                        "{AUTH_403} no access to this project (HTTP 403); ask for a token scoped to it"
+                    ),
                     (_, Some(m)) => m,
                     (c, None) => format!("hub answered HTTP {c}"),
                 }
@@ -153,6 +156,57 @@ impl Http for UreqHttp {
     }
 }
 
+/// Projects the calling token may open: `[(slug, name)]` from `GET /api/projects`.
+///
+/// The hub already drops slugs a scoped token cannot see; the TUI
+/// only turns the payload into picker rows.
+pub fn list_projects<H: Http>(http: &H) -> Result<Vec<(String, String)>, String> {
+    let payload = http.get("/api/projects")?;
+    let rows = payload
+        .get("projects")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "hub sent no project list".to_string())?;
+    Ok(rows
+        .iter()
+        .filter_map(|p| {
+            let slug = p.get("slug").and_then(Value::as_str)?.trim();
+            if slug.is_empty() {
+                return None;
+            }
+            let name = p
+                .get("name")
+                .or_else(|| p.get("title"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(slug);
+            Some((slug.to_string(), name.to_string()))
+        })
+        .collect())
+}
+
+/// Prefixes `UreqHttp::fail` puts on auth refusals so `HubSource` can turn them
+/// into [`SourceError::Auth`] without matching prose.
+pub const AUTH_401: &str = "auth401:";
+pub const AUTH_403: &str = "auth403:";
+
+/// Turn an HTTP error string into the source-facing error, keeping 401 and 403 apart.
+fn hub_error(message: String) -> SourceError {
+    if let Some(rest) = message.strip_prefix(AUTH_401) {
+        return SourceError::Auth {
+            forbidden: false,
+            message: rest.trim().to_string(),
+        };
+    }
+    if let Some(rest) = message.strip_prefix(AUTH_403) {
+        return SourceError::Auth {
+            forbidden: true,
+            message: rest.trim().to_string(),
+        };
+    }
+    SourceError::Cli(message)
+}
+
 pub struct HubSource<H: Http> {
     http: H,
     slug: String,
@@ -196,7 +250,7 @@ impl<H: Http> HubSource<H> {
 
 impl<H: Http> Source for HubSource<H> {
     fn snapshot(&mut self) -> Result<Snapshot, SourceError> {
-        let get = |s: &str| self.http.get(&self.route(s)).map_err(SourceError::Cli);
+        let get = |s: &str| self.http.get(&self.route(s)).map_err(hub_error);
         let list = get("list")?;
         let ready = get("ready")?;
         let disjoint = get("ready?disjoint=1")?;
@@ -216,11 +270,11 @@ impl<H: Http> Source for HubSource<H> {
     }
 
     fn act(&mut self, action: &Action) -> Result<String, String> {
+        let host = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "tui".into());
         match action {
             Action::Done { id, changelog } => {
-                let host = std::env::var("COMPUTERNAME")
-                    .or_else(|_| std::env::var("HOSTNAME"))
-                    .unwrap_or_else(|_| "tui".into());
                 let mut body =
                     json!({ "task": id, "owner": self.owner(), "force": false, "host": host });
                 if let Some(c) = changelog
@@ -231,17 +285,52 @@ impl<H: Http> Source for HubSource<H> {
                     body["changelog"] = json!(c);
                 }
                 self.http.post(&self.route("done"), &body)?;
-                Ok(format!("done {id}"))
+                Ok(format!("✓ Task {id} marked as done."))
             }
             Action::Start { id } => {
-                let body = json!({ "task": id, "owner": self.owner(), "force": false });
-                self.http.post(&self.route("start"), &body)?;
-                Ok(format!("started {id}"))
+                let body =
+                    json!({ "task": id, "owner": self.owner(), "force": false, "host": host });
+                let resp = self.http.post(&self.route("start"), &body)?;
+                let lease = resp
+                    .get("lease_expires_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let verb = if resp
+                    .get("refreshed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "lease refreshed"
+                } else {
+                    "started"
+                };
+                Ok(format!(
+                    "► Task {id} {verb} by {}, lease to {lease}.",
+                    self.owner()
+                ))
             }
-            other => Err(format!(
-                "the hub has no route for {} yet; run it against the checkout",
-                other.verb()
-            )),
+            Action::Defer { id, note } => {
+                let mut body =
+                    json!({ "task": id, "owner": self.owner(), "force": false, "host": host });
+                if !note.trim().is_empty() {
+                    body["note"] = json!(note.trim());
+                }
+                let resp = self.http.post(&self.route("look-defer"), &body)?;
+                let from = resp.get("from").and_then(Value::as_str).unwrap_or("?");
+                Ok(format!("◐ Task {id} queued for a human look (was {from})."))
+            }
+            Action::Clear { id } | Action::Reject { id } => {
+                let reject = matches!(action, Action::Reject { .. });
+                let mut body =
+                    json!({ "task": id, "owner": self.owner(), "force": false, "host": host });
+                if reject {
+                    body["reject"] = json!(true);
+                }
+                let resp = self.http.post(&self.route("look-clear"), &body)?;
+                let to = resp.get("to").and_then(Value::as_str).unwrap_or("done");
+                let icon = if to == "done" { "✓" } else { "·" };
+                Ok(format!("{icon} Task {id} cleared: {to}."))
+            }
         }
     }
 }
@@ -255,6 +344,10 @@ pub enum StreamMsg {
     Disconnected,
     /// The hub offers no stream; fall back to polling for good.
     Unsupported,
+    /// The hub refused the credential or the project; stop, do not reconnect.
+    Denied {
+        forbidden: bool,
+    },
 }
 
 /// SSE comments (`: heartbeat`) and `id:`/`event:` lines are not changes; only `data:` is.
@@ -295,6 +388,12 @@ pub fn spawn_stream(http: UreqHttp, slug: String, tx: Sender<StreamMsg>) {
                 }
                 Err(e) if e == "hub has no event stream" => {
                     let _ = tx.send(StreamMsg::Unsupported);
+                    return;
+                }
+                Err(e) if e.starts_with(AUTH_401) || e.starts_with(AUTH_403) => {
+                    let _ = tx.send(StreamMsg::Denied {
+                        forbidden: e.starts_with(AUTH_403),
+                    });
                     return;
                 }
                 Err(_) => {
@@ -371,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn done_posts_the_serve_body_and_other_actions_are_refused() {
+    fn every_action_posts_its_serve_route_and_body() {
         let mut hub = HubSource::new(
             Fixture {
                 routes: HashMap::new(),
@@ -380,21 +479,139 @@ mod tests {
             "demo",
         )
         .with_owner(Some("tui".into()));
-        hub.act(&Action::Done {
-            id: "1.0.1".into(),
-            changelog: Some(" shipped ".into()),
+        assert_eq!(
+            hub.act(&Action::Start { id: "1.0.1".into() }).unwrap(),
+            "► Task 1.0.1 started by tui, lease to ?."
+        );
+        assert_eq!(
+            hub.act(&Action::Done {
+                id: "1.0.1".into(),
+                changelog: Some(" shipped ".into()),
+            })
+            .unwrap(),
+            "✓ Task 1.0.1 marked as done."
+        );
+        assert_eq!(
+            hub.act(&Action::Defer {
+                id: "1.0.1".into(),
+                note: " eyeball ".into(),
+            })
+            .unwrap(),
+            "◐ Task 1.0.1 queued for a human look (was ?)."
+        );
+        assert_eq!(
+            hub.act(&Action::Clear { id: "1.0.1".into() }).unwrap(),
+            "✓ Task 1.0.1 cleared: done."
+        );
+        assert_eq!(
+            hub.act(&Action::Reject { id: "1.0.1".into() }).unwrap(),
+            "✓ Task 1.0.1 cleared: done."
+        );
+        let posts = hub.http.posts.lock().unwrap();
+        let paths: Vec<&str> = posts.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/api/demo/start",
+                "/api/demo/done",
+                "/api/demo/look-defer",
+                "/api/demo/look-clear",
+                "/api/demo/look-clear",
+            ]
+        );
+        for (_, body) in posts.iter() {
+            assert_eq!(body["task"], "1.0.1");
+            assert_eq!(body["owner"], "tui");
+            assert_eq!(body["force"], false);
+            assert!(body["host"].is_string());
+        }
+        assert_eq!(posts[1].1["changelog"], "shipped");
+        assert_eq!(posts[2].1["note"], "eyeball");
+        assert!(posts[3].1.get("reject").is_none());
+        assert_eq!(posts[4].1["reject"], true);
+    }
+
+    #[test]
+    fn project_list_keeps_names_and_skips_blank_slugs() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/api/projects".to_string(),
+            json!({"projects": [
+                {"slug": "demo", "name": "Demo"},
+                {"slug": "other"},
+                {"slug": " "}
+            ]}),
+        );
+        let projects = list_projects(&Fixture {
+            routes,
+            posts: Mutex::new(vec![]),
         })
         .unwrap();
-        let posts = hub.http.posts.lock().unwrap();
-        assert_eq!(posts[0].0, "/api/demo/done");
-        assert_eq!(posts[0].1["task"], "1.0.1");
-        assert_eq!(posts[0].1["owner"], "tui");
-        assert_eq!(posts[0].1["changelog"], "shipped");
-        drop(posts);
-        assert!(hub
-            .act(&Action::Clear { id: "1.0.1".into() })
-            .unwrap_err()
-            .contains("no route"));
+        assert_eq!(
+            projects,
+            vec![
+                ("demo".to_string(), "Demo".to_string()),
+                ("other".to_string(), "other".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_errors_stay_distinct_and_name_the_fix() {
+        let unauthorized = hub_error(format!(
+            "{AUTH_401} token rejected (HTTP 401); set --token or $TIDETABLE_TOKEN"
+        ));
+        assert!(matches!(
+            unauthorized,
+            SourceError::Auth {
+                forbidden: false,
+                ..
+            }
+        ));
+        let forbidden = hub_error(format!(
+            "{AUTH_403} no access to this project (HTTP 403); ask for a token scoped to it"
+        ));
+        assert!(matches!(
+            forbidden,
+            SourceError::Auth {
+                forbidden: true,
+                ..
+            }
+        ));
+        assert!(unauthorized.to_string().contains("TIDETABLE_TOKEN"));
+        assert!(forbidden.to_string().contains("scoped"));
+    }
+
+    fn one_shot_http(status: &str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                format!("HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}")
+                    .as_bytes(),
+            );
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn http_401_and_403_never_echo_the_token() {
+        for (status, want) in [
+            ("401 Unauthorized", "token rejected"),
+            ("403 Forbidden", "no access"),
+        ] {
+            let (base, server) = one_shot_http(status);
+            let http = UreqHttp::new(&base, Some("sekret-token".into())).unwrap();
+            let err = http.get("/api/projects").unwrap_err();
+            assert!(err.contains(want), "{err}");
+            assert!(!err.contains("sekret-token"), "{err}");
+            server.join().unwrap();
+        }
     }
 
     #[test]

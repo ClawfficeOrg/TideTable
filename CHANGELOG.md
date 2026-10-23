@@ -9,12 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Every TUI action works in hub mode.** `s` start, `d` done, `l` defer, `c` clear and `x` reject post their hub routes with one owner, and the toast matches the CLI.
+- **Hub slug resolution and project picker in `tidetable tui --server`.** The slug comes from the argument, `$TIDETABLE_PROJECT`, a `slug` key in the nearest `.tidetable/config.json`, or a picker over `GET /api/projects`. It never reads git remotes.
+- **Remote claim detail in the TUI.** In-progress rows show the owner, claim age and lease time left.
 - **`GET /api/projects` is token-scoped.** A machine token saw only the slugs it may open; the shared `TK_API_TOKEN` saw all.
 - **`tidetable edit <file> <id>`** changed a task's plan fields without hand-editing JSON: `--title`, `--goal`, `--tests`, `--complexity`, `--agent`, `--parallel-group`, repeatable `--prereq`/`--touches`/`--success` that replace the whole list, and the matching `--clear-*` flags. Status and claims were never touched; dangling, self or cyclic prerequisites were refused and nothing was written. Every edit appended one `edit` event. Also `POST /api/<slug>/edit` and `tidetable --server`.
 - Hub routes `POST /api/<slug>/look-defer` and `look-clear`, and `tidetable --server` support for both (`look-clear --reject` sends the task back to pending).
 
 ### Fixed
 
+- The TUI stops retrying on a hub 401 or 403 and says what to change (`token rejected · set $TIDETABLE_TOKEN`, `no access to this project`) instead of backing off forever.
 - **Hub writes carry a base and a stale one is refused.** `POST /api/<slug>/start`, `/done`, `/reset` and `/status` took a `base` (the hub's event count when the caller decided) and answered `409 {"conflict": true, "task", "base", "current"}` when that task changed after it, without applying the write. A duplicate `done` still returned `already_done`.
 - **`POST /api/<slug>/reset` no longer ran blind.** It required a `base` (428 without one) and refused another owner's live claim with a 409 unless `force` was set.
 - `tidetable --server` sent `--base N` when given, else fetched the hub's current base just before the write; `reset --force` reached the hub.

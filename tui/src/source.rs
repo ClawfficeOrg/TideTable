@@ -45,12 +45,19 @@ pub struct Running {
     pub owner: Option<String>,
     /// `...Z` timestamp from the claim; use [`Running::age_secs`] to render age.
     pub claimed_at: Option<String>,
+    /// `...Z` when the claim lapses; use [`Running::lease_left_secs`] for time left.
+    pub lease_expires_at: Option<String>,
     pub lease_expired: bool,
 }
 
 impl Running {
     pub fn age_secs(&self, now_epoch: i64) -> Option<i64> {
         Some((now_epoch - parse_utc(self.claimed_at.as_deref()?)?).max(0))
+    }
+
+    /// Seconds until the lease lapses; negative once it has. None when unclaimed.
+    pub fn lease_left_secs(&self, now_epoch: i64) -> Option<i64> {
+        Some(parse_utc(self.lease_expires_at.as_deref()?)? - now_epoch)
     }
 }
 
@@ -113,6 +120,8 @@ pub enum SourceError {
     Pick(Vec<PathBuf>),
     /// The CLI failed or could not be started.
     Cli(String),
+    /// The hub refused the credential (401) or the project (403); retrying cannot help.
+    Auth { forbidden: bool, message: String },
     /// The CLI answered something that is not the JSON we expect.
     Parse(String),
 }
@@ -125,6 +134,7 @@ impl fmt::Display for SourceError {
             }
             Self::Pick(files) => write!(f, "{} todo files found; pick one", files.len()),
             Self::Cli(m) => write!(f, "tidetable failed: {m}"),
+            Self::Auth { message, .. } => write!(f, "{message}"),
             Self::Parse(m) => write!(f, "unexpected tidetable output: {m}"),
         }
     }
@@ -470,6 +480,10 @@ pub fn build_snapshot(
                 .get("claimed_at")
                 .and_then(Value::as_str)
                 .map(String::from),
+            lease_expires_at: t
+                .get("lease_expires_at")
+                .and_then(Value::as_str)
+                .map(String::from),
             lease_expired: t
                 .get("lease_expired")
                 .and_then(Value::as_bool)
@@ -772,9 +786,12 @@ more"
         let t = parse_utc("2026-10-17T06:29:33Z").unwrap();
         let r = Running {
             claimed_at: Some("2026-10-17T06:29:33Z".into()),
+            lease_expires_at: Some("2026-10-17T07:29:33Z".into()),
             ..Running::default()
         };
         assert_eq!(r.age_secs(t + 90), Some(90));
+        assert_eq!(r.lease_left_secs(t), Some(3600));
+        assert_eq!(r.lease_left_secs(t + 3601), Some(-1));
         assert_eq!(parse_utc("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_utc("junk"), None);
     }

@@ -20,6 +20,10 @@ pub enum Conn {
     Offline {
         retry_in: u64,
     },
+    /// 401/403: retrying cannot help; fix the token or project scope and restart.
+    Denied {
+        forbidden: bool,
+    },
 }
 
 /// Detects a todo file or its `.events.jsonl` changing on disk.
@@ -65,6 +69,7 @@ pub struct Refresher {
     last: Instant,
     fails: usize,
     retry_at: Option<Instant>,
+    denied: Option<bool>,
 }
 
 impl Refresher {
@@ -76,7 +81,14 @@ impl Refresher {
             last: now,
             fails: 0,
             retry_at: None,
+            denied: None,
         }
+    }
+
+    /// Stop for good: a 401/403 is not transient.
+    pub fn deny(&mut self, forbidden: bool) {
+        self.denied = Some(forbidden);
+        self.retry_at = None;
     }
 
     pub fn set_stream(&mut self, live: bool) {
@@ -85,6 +97,9 @@ impl Refresher {
 
     /// `pushed`: a stream event or a file-change notice arrived since the last call.
     pub fn due(&self, now: Instant, pushed: bool) -> bool {
+        if self.denied.is_some() {
+            return false;
+        }
         if let Some(at) = self.retry_at {
             return now >= at;
         }
@@ -104,6 +119,7 @@ impl Refresher {
         if ok {
             self.fails = 0;
             self.retry_at = None;
+            self.denied = None;
         } else {
             let wait = BACKOFF[self.fails.min(BACKOFF.len() - 1)];
             self.fails += 1;
@@ -112,6 +128,9 @@ impl Refresher {
     }
 
     pub fn conn(&self, now: Instant) -> Conn {
+        if let Some(forbidden) = self.denied {
+            return Conn::Denied { forbidden };
+        }
         if let Some(at) = self.retry_at {
             let left = at.saturating_duration_since(now);
             return Conn::Offline {
@@ -183,6 +202,20 @@ mod tests {
         );
         r.record(true, t0 + secs(60));
         assert_eq!(r.conn(t0 + secs(60)), Conn::Polling);
+    }
+
+    #[test]
+    fn auth_denial_stops_the_retry_loop_until_a_later_success() {
+        let t0 = Instant::now();
+        let mut r = Refresher::new(true, t0);
+        r.deny(false);
+        assert_eq!(r.conn(t0), Conn::Denied { forbidden: false });
+        assert!(!r.due(t0 + secs(600), true), "no retry after 401");
+        r.deny(true);
+        assert_eq!(r.conn(t0), Conn::Denied { forbidden: true });
+        r.record(true, t0);
+        assert_eq!(r.conn(t0), Conn::Polling);
+        assert!(r.due(t0 + secs(2), false));
     }
 
     #[test]

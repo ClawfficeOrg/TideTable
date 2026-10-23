@@ -273,13 +273,18 @@ checked at all.
 
 `tidetable tui` opens a ratatui front end (Now / Upcoming / Done / Review) for a todo file
 or a hub project. It is a separate binary, not part of the wheel, and it never writes a todo
-file: actions go through the CLI or the hub.
+file: actions go through the CLI or the hub, and every action (start, done, defer, clear,
+reject) works in both modes.
 
 ```bash
 cargo build --release --manifest-path tui/Cargo.toml     # Rust 1.88+
 tidetable tui [--mode auto|standard|side|bottom] [--tmux] [-- docs/todo.json --read-only]
 tidetable-tui --server https://hub.example myproj        # token from $TIDETABLE_TOKEN
 ```
+
+In hub mode the project slug comes from the positional argument, `$TIDETABLE_PROJECT`, a
+`slug` key in the nearest `.tidetable/config.json`, or a picker over `GET /api/projects`.
+The picker and the project list are scoped to the token.
 
 Keys: `j`/`k` move, `Tab`/`1`-`4` views, `Space` tick a review criterion, `s` start (Upcoming), `d` done, `l` defer,
 `c` clear, `x` reject, `r` refresh, `q` quit. `--read-only` removes the action keys.

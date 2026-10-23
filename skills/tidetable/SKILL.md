@@ -318,9 +318,12 @@ tidetable agents set pro_dev_agent --model claude-opus-5 --scope repo
 `tidetable tui [--mode auto|standard|side|bottom] [--tmux] [-- TUI_ARGS]` launches the
 `tidetable-tui` binary (build: `cargo build --release --manifest-path tui/Cargo.toml`). It
 shows Now / Upcoming / Done / Review for a todo file or hub project (`--server URL SLUG`,
-token from `$TIDETABLE_TOKEN`). Humans use it; agents keep using the CLI. It never writes a
-todo file: `s` start, `d` done, `l` defer, `c` clear and `x` reject all run the CLI (`--read-only`
-disables them). Details: `docs/integration-guide.md`.
+token from `$TIDETABLE_TOKEN`). Hub mode resolves the slug from the argument,
+`$TIDETABLE_PROJECT`, a `slug` key in `.tidetable/config.json`, or a picker; 401 and 403 stop
+retrying and say what to change. Humans use it; agents keep using the CLI. It never writes a
+todo file: `s` start, `d` done, `l` defer, `c` clear and `x` reject all run the CLI locally
+or the matching hub route (`--read-only` disables them). Details:
+`docs/integration-guide.md`.
 
 ## Attended and unattended runs
 

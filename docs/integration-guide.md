@@ -315,7 +315,7 @@ the only file it writes is the review-tick sidecar `.tidetable/review-ticks.json
 | --- | --- | --- |
 | `tidetable tui docs/todo.json` | that file, through the `tidetable` CLI (always `--local`) | start, done, defer, clear, reject |
 | `tidetable tui` | the first `todo*.json` the CLI finds | same |
-| `tidetable tui my-slug --server URL` (or `$TIDETABLE_SERVER`) | the hub project, with live updates on its event stream | start and done only; the hub has no routes for the rest |
+| `tidetable tui my-slug --server URL` (or `$TIDETABLE_SERVER`) | the hub project, with live updates on its event stream | start, done, defer, clear, reject |
 | any of the above plus `--local` | forces local even when `$TIDETABLE_SERVER` is exported | local set |
 
 Claims and finishes use one owner: `--owner`, else `$TIDETABLE_OWNER`, else `tui@<host>`. A task started by someone else must be finished by them, or by running the TUI with their `--owner`.
@@ -356,14 +356,17 @@ notes only; `c` is what clears an item.
 **Hub.** `tidetable-tui --server URL SLUG` (or `$TIDETABLE_SERVER` and `$TIDETABLE_TOKEN`;
 prefer the environment, since `--token` shows in process listings; `--local` ignores an
 exported server) reads the same routes as `tidetable --server`, plus
-`GET /api/<slug>/look-queue`. It refreshes on the hub's `/api/stream` events, else polls
+`GET /api/<slug>/look-queue`. The slug resolves in this order: the positional argument,
+`$TIDETABLE_PROJECT`, a `slug` key in the nearest `.tidetable/config.json`, then a picker
+over `GET /api/projects` (j/k, Enter; an empty list says what to do). It never reads git
+remotes. It refreshes on the hub's `/api/stream` events, else polls
 every 2 s, and the footer shows `✓ live` or `· polling`. If the hub drops, the last data
 stays on screen dimmed with `⊘ offline · retry Ns · data Nm old`, and retries back off
-2, 4, 8, 16, 30 s. The token only travels in the `Authorization` header and is never shown,
-logged or stored. Over the hub only `d` is available; clear, reject and defer are not wired
-into the TUI client yet, even though the hub now has `look-defer`/`look-clear` routes
-(`tidetable --server` can call them). Local mode refreshes when the todo or its
-`.events.jsonl` changes, else every 5 s.
+2, 4, 8, 16, 30 s. A 401 or 403 does not retry: the footer says
+`token rejected · set $TIDETABLE_TOKEN` or `no access to this project · ask for a scoped
+token`. In-progress rows show the owner, claim age and `lease … left`. The token only
+travels in the `Authorization` header and is never shown, logged or stored. Local mode
+refreshes when the todo or its `.events.jsonl` changes, else every 5 s.
 
 **Palettes.** `--palette NAME` or `$TIDETABLE_PALETTE`: `biolume` (default), `deep-tide`,
 `sea-glass`, `phosphor`, `boiled`, vendored from clawffice-design. Colour depth falls

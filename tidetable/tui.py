@@ -5,6 +5,10 @@ This module only finds the binary and builds one command line; it never reads or
 todo file, and the TUI itself never writes one either (it shells out to the CLI or talks to a
 hub). The Rust crate is not part of the wheel, so the binary comes from a checkout build or
 from PATH.
+
+Hub mode resolves the project slug inside the binary, in this order: the positional
+argument, `$TIDETABLE_PROJECT`, a `slug` key in the nearest `.tidetable/config.json`, then
+a project picker. This launcher forwards arguments untouched and never guesses a slug.
 """
 
 from __future__ import annotations

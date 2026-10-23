@@ -34,6 +34,7 @@ fn snap() -> Snapshot {
                 title: "Layout modes".into(),
                 owner: Some("bot:1".into()),
                 claimed_at: Some("2026-10-17T06:00:00Z".into()),
+                lease_expires_at: Some("2026-10-17T07:42:00Z".into()),
                 lease_expired: false,
             },
             Running {
@@ -41,6 +42,7 @@ fn snap() -> Snapshot {
                 title: "Stale thing".into(),
                 owner: Some("bot:2".into()),
                 claimed_at: Some("2026-10-17T01:00:00Z".into()),
+                lease_expires_at: Some("2026-10-17T02:00:00Z".into()),
                 lease_expired: true,
             },
         ],
@@ -187,9 +189,48 @@ fn nothing_panics_at_tiny_sizes() {
                 let _ = render(&mut a, w, h);
                 a.load = Load::Pick(vec!["a.json".into(), "b.json".into()]);
                 let _ = render(&mut a, w, h);
+                a.load = Load::PickProjects(vec![("a".into(), "A".into())]);
+                let _ = render(&mut a, w, h);
             }
         }
     }
+}
+
+#[test]
+fn denied_conn_says_what_to_change_and_never_shows_a_token() {
+    let mut a = app(ModeArg::Standard);
+    a.conn = Conn::Denied { forbidden: false };
+    let (_, text) = render(&mut a, 100, 30);
+    assert!(text.contains("token rejected"), "{text}");
+    assert!(text.contains("$TIDETABLE_TOKEN"), "{text}");
+    a.conn = Conn::Denied { forbidden: true };
+    let (_, text) = render(&mut a, 100, 30);
+    assert!(text.contains("no access to this project"), "{text}");
+    assert!(text.contains("scoped token"), "{text}");
+    assert!(!text.contains("sekret"), "{text}");
+}
+
+#[test]
+fn project_picker_lists_slugs_and_opens_the_chosen_one() {
+    let mut a = app(ModeArg::Standard);
+    a.load = Load::PickProjects(vec![
+        ("alpha".into(), "Alpha".into()),
+        ("beta".into(), "Beta".into()),
+    ]);
+    let (_, text) = render(&mut a, 80, 20);
+    assert!(text.contains("alpha") && text.contains("Alpha"), "{text}");
+    a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(a.chosen_slug.as_deref(), Some("beta"));
+}
+
+#[test]
+fn empty_project_picker_says_what_to_do() {
+    let mut a = app(ModeArg::Standard);
+    a.load = Load::PickProjects(vec![]);
+    let (_, text) = render(&mut a, 100, 20);
+    assert!(text.contains("no projects"), "{text}");
+    assert!(text.contains("slug"), "{text}");
 }
 
 #[test]
@@ -218,7 +259,7 @@ fn every_view_renders_in_every_mode() {
 #[test]
 fn now_shows_owner_age_and_lease_state_with_icon_and_word() {
     let (_, text) = render(&mut app(ModeArg::Standard), 100, 30);
-    assert!(text.contains("bot:1 · 1h00m · lease ok"), "{text}");
+    assert!(text.contains("bot:1 · 1h00m · lease 42m left"), "{text}");
     assert!(text.contains("⚠ stale lease"));
     assert!(text.contains("bot:2 · 6h00m · lease expired"));
     assert!(text.contains("► in progress"));

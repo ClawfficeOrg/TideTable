@@ -185,7 +185,11 @@ in the same change.
 
 **The TUI never writes a todo file.** `tui/` reads through the `tidetable` CLI (local) or the
 hub (`--server`) and acts through the same two doors; the only file it writes is the
-review-tick sidecar. A test greps the data layer for write APIs. A new hub read goes in
+review-tick sidecar. Every action has a hub route: start, done, look-defer, look-clear
+(handled by `handle_post`, never by a second DAG implementation). Hub mode resolves the
+project slug from the argument, `$TIDETABLE_PROJECT`, `.tidetable/config.json`, then
+`GET /api/projects` (token-scoped); it never reads git remotes. 401/403 stop the refresh
+loop instead of backing off. A test greps the data layer for write APIs. A new hub read goes in
 `remote.ROUTES` and `serve.ROUTES` with a `TestRemoteClient` test.
 
 **Every behavior change gets a test.** `tests/test_cli.py` is stdlib
