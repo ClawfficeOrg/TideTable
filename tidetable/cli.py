@@ -48,8 +48,11 @@ from tidetable.jsonio import (
     env_get,
     FileLock,
     LockTimeout,
+    append_conflict,
     append_event,
+    conflicts_path,
     events_path,
+    read_conflicts,
     read_events,
     read_json,
     write_json,
@@ -1665,6 +1668,23 @@ def cmd_history(args) -> int:
     return 0
 
 
+def cmd_conflicts(args) -> int:
+    """List the writes the hub refused as stale. Read-only: resolving one is a person's call."""
+    conflicts = read_conflicts(args.todo_file)
+    if args.json:
+        emit_json({"path": str(conflicts_path(args.todo_file)), "conflicts": conflicts})
+        return 0
+    if not conflicts:
+        print(f"No conflicts recorded in {conflicts_path(args.todo_file).name}")
+        return 0
+    print(f"Conflicts — {conflicts_path(args.todo_file).name}")
+    print("═" * 62)
+    for c in conflicts:
+        print(f"  {c.get('at', '?')}  {c.get('route', '?'):<8} {c.get('task', ''):<10}"
+              f"  base {c.get('base')} < {c.get('current')}  [{c.get('owner', '-')}]")
+    return 0
+
+
 def cmd_validate(args) -> int:
     return 0 if validate_todo(args.todo_file, schema_only=args.schema_only) else 1
 
@@ -1775,6 +1795,15 @@ def build_parser() -> argparse.ArgumentParser:
                             "(default: $TIDETABLE_OWNER, else host:pid)")
         return p
 
+    def add_base(p):
+        # Hub only. A queued write must pass the base it saw when it decided; the
+        # fetch-on-send default only suits a call made the moment it was decided.
+        p.add_argument("--base", type=int, metavar="N",
+                       help="With --server: the hub event count this write was decided "
+                            "against; the hub refuses it if the task changed since "
+                            "(default: the hub's current count, fetched just before)")
+        return p
+
     p = add_command("validate", "Schema + semantic validation")
     p.add_argument("--schema-only", action="store_true", help="Skip the semantic checks")
     p.set_defaults(func=cmd_validate)
@@ -1792,15 +1821,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "or anything in progress — safe to fan out as a set")
     p.set_defaults(func=cmd_ready)
 
-    p = add_owner(add_command("start", "Claim a task (-> in_progress)",
-                              task_id=True, json_out=True))
+    p = add_base(add_owner(add_command("start", "Claim a task (-> in_progress)",
+                                       task_id=True, json_out=True)))
     p.add_argument("--force", action="store_true", help="Start despite unmet prerequisites")
     p.add_argument("--lease", type=int, metavar="MINUTES",
                    help=f"How long the claim holds (default: "
                         f"$TIDETABLE_LEASE_MINUTES, else {DEFAULT_LEASE_MINUTES})")
     p.set_defaults(func=cmd_start)
 
-    p = add_owner(add_command("done", "Mark a task done", task_id=True, json_out=True))
+    p = add_base(add_owner(add_command("done", "Mark a task done", task_id=True,
+                                       json_out=True)))
     p.add_argument("--force", action="store_true",
                    help="Finish despite unmet prerequisites or someone else's claim")
     p.add_argument("--changelog", help="Changelog line for this task")
@@ -1820,10 +1850,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reject", action="store_true", help="The check failed: back to pending")
     p.set_defaults(func=cmd_look_clear)
 
-    p = add_owner(add_command("reset", "Return a task to pending", task_id=True))
+    p = add_base(add_owner(add_command("reset", "Return a task to pending", task_id=True)))
+    p.add_argument("--force", action="store_true",
+                   help="With --server: reset even while another owner's lease is live")
     p.set_defaults(func=cmd_reset)
 
-    p = add_owner(add_command("status", "Set an arbitrary status", task_id=True))
+    p = add_base(add_owner(add_command("status", "Set an arbitrary status", task_id=True)))
     p.add_argument("status", choices=VALID_STATUSES)
     p.add_argument("--moved-to", dest="moved_to", help="Target task ID (required for moved)")
     p.set_defaults(func=cmd_status)
@@ -1873,6 +1905,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task", dest="task_id", metavar="TASK_ID", help="Only this task's events")
     p.add_argument("--limit", type=int, default=50, help="Show the last N events (default 50)")
     p.set_defaults(func=cmd_history)
+
+    p = add_command("conflicts", "List writes the hub refused as stale (read-only)",
+                    json_out=True)
+    p.set_defaults(func=cmd_conflicts)
 
     p = add_command("convert", "Render the todo file as markdown")
     p.add_argument("-o", "--output", help="Write to this file instead of stdout")

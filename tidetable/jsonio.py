@@ -275,9 +275,34 @@ def append_event(todo_path: str | Path, event: dict) -> None:
         pass
 
 
+def conflicts_path(todo_path: str | Path) -> Path:
+    """The hub's conflict list beside a todo file: writes it refused as stale."""
+    return Path(str(todo_path) + ".conflicts.jsonl")
+
+
+def append_conflict(todo_path: str | Path, entry: dict) -> None:
+    """Append one refused write. Append-only: a person resolves conflicts, nothing replays them.
+
+    Unlike `append_event` this ignores `TIDETABLE_EVENTS=0` and does not swallow
+    errors: the conflict list is the only record of a write the hub threw away.
+    """
+    path = conflicts_path(todo_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def read_conflicts(todo_path: str | Path) -> list[dict]:
+    """Every recorded conflict, oldest first."""
+    return _read_jsonl(conflicts_path(todo_path))
+
+
 def read_events(todo_path: str | Path) -> list[dict]:
     """Every event, oldest first. Unparseable lines are skipped, not fatal."""
-    path = events_path(todo_path)
+    return _read_jsonl(events_path(todo_path))
+
+
+def _read_jsonl(path: Path) -> list[dict]:
     if not path.is_file():
         return []
     out: list[dict] = []

@@ -45,6 +45,8 @@ ROUTES: dict[tuple[str, str], str] = {
     ("GET", "/api/{slug}/parallel"): "cmd_parallel",
     ("GET", "/api/{slug}/sessions"): "sessions",
     ("GET", "/api/{slug}/sidebar"): "sidebar",
+    ("GET", "/api/{slug}/base"): "base",
+    ("GET", "/api/{slug}/conflicts"): "cmd_conflicts",
     ("GET", "/api/stream"): "stream",
     ("POST", "/api/{slug}/start"): "cmd_start",
     ("POST", "/api/{slug}/done"): "cmd_done",
@@ -508,7 +510,69 @@ def handle_get(route: str, slug: str | None, query: Mapping[str, str],
         db = _resolve_sessions_db(registry, sessions_db)
         return 200, {"slug": slug, "sessions": sessions_store.list_sessions(db, slug)}
 
+    if route == "/api/{slug}/base":
+        return 200, {"slug": slug, "base": event_base(todo_path)}
+
+    if route == "/api/{slug}/conflicts":
+        return 200, {"path": str(cli.conflicts_path(todo_path)),
+                     "conflicts": cli.read_conflicts(todo_path)}
+
     return 404, {"error": f"unknown route: {route}"}
+
+
+def event_base(todo_path: str) -> int:
+    """The hub's version for a slug: how many events its log holds.
+
+    A write carries the base it saw when it decided; the hub compares it with
+    this count to tell whether the task moved underneath the writer.
+    """
+    return len(cli.read_events(todo_path))
+
+
+#: A base that is not a non-negative integer.
+_BAD_BASE = object()
+
+
+def _parse_base(value: object) -> object:
+    """``None`` when absent, an ``int`` when valid, else ``_BAD_BASE``."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return None
+    if isinstance(value, bool):
+        return _BAD_BASE
+    try:
+        base = int(str(value).strip())
+    except ValueError:
+        return _BAD_BASE
+    return base if base >= 0 else _BAD_BASE
+
+
+def _stale_base(todo_path: str, route: str, task_id: str, base: int, owner: str,
+                body: Mapping[str, object]) -> tuple[int, dict] | None:
+    """409 when ``task_id`` changed after ``base``; the refusal goes on the conflict list.
+
+    Called inside the write lock, so the events read here are the ones the
+    write would land after. A base beyond the log (rotated, or from another
+    hub) is a conflict too: the hub cannot vouch for what the writer saw.
+    Nothing ever replays a recorded conflict; a person reads the list and
+    decides.
+    """
+    events = cli.read_events(todo_path)
+    current = len(events)
+    since = [e for e in events[base:] if e.get("task") == task_id] if base <= current else []
+    if base <= current and not since:
+        return None
+    cli.append_conflict(todo_path, {
+        "at": cli.utc_now(),
+        "route": route.rsplit("/", 1)[-1],
+        "task": task_id,
+        "owner": owner,
+        "base": base,
+        "current": current,
+        "changed_by": [{k: e.get(k) for k in ("at", "event", "owner", "from", "to")
+                        if e.get(k) is not None} for e in since],
+        "request": {k: v for k, v in body.items() if v is not None},
+    })
+    return 409, {"conflict": True, "task": task_id, "base": base, "current": current}
 
 
 def _body_truthy(value: object) -> bool:
@@ -550,6 +614,9 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
     data_in: dict = dict(body or {})
     owner = str(data_in.get("owner") or data_in.get("actor") or cli.default_owner())
     extras = _body_extras(data_in)
+    base = _parse_base(data_in.get("base"))
+    if base is _BAD_BASE:
+        return 400, {"error": "base must be a non-negative integer (GET /api/<slug>/base)"}
     db = _resolve_sessions_db(registry, sessions_db)
 
     if route == "/api/{slug}/heartbeat":
@@ -593,6 +660,10 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                 phase, task = cli.find_task(data, task_id)
                 if task is None:
                     return 404, {"error": f"task {task_id} not found"}
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
                 if task.get("status") == "done":
                     return 409, {"error": f"task {task_id} is already done. Use reset to reopen it."}
                 stolen_from = None
@@ -656,6 +727,11 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                         "release_ready": False,
                         "release": cli.release_state(phase) if phase else None,
                     }
+                # After already_done, so a retried done stays idempotent.
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
                 holder = task.get("claimed_by")
                 if (task.get("status") == "in_progress" and holder and holder != owner
                         and not cli.lease_expired(task) and not force):
@@ -700,14 +776,28 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                       or data_in.get("id") or "").strip()
         if not task_id:
             return 400, {"error": "missing task=<id>"}
+        # Reset throws away someone's claim or finished work, so it never runs blind.
+        if base is None:
+            return 428, {"error": "reset needs base=<event count> "
+                                  "(GET /api/<slug>/base when you decide)"}
+        force = _body_truthy(data_in.get("force"))
         with _WRITE_LOCK:
             with FileLock(todo_path):
                 data = cli.load_todo(todo_path)
                 _, task = cli.find_task(data, task_id)
                 if task is None:
                     return 404, {"error": f"task {task_id} not found"}
+                stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                if stale:
+                    return stale
                 previous = task.get("status")
                 held_by = task.get("claimed_by")
+                if (previous == "in_progress" and held_by and held_by != owner
+                        and not cli.lease_expired(task) and not force):
+                    return 409, {
+                        "error": f"task {task_id} is held by {held_by} until "
+                                 f"{task.get('lease_expires_at')}; reset refused.",
+                    }
                 cli.set_status(data, task_id, "pending")
                 cli.save_todo(data, todo_path)
                 cli.record_event(todo_path, "reset", task=task_id, owner=owner,
@@ -744,6 +834,10 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                     return 404, {"error": f"task {task_id} not found"}
                 if moved_to_text and cli.find_task(data, moved_to_text)[1] is None:
                     return 404, {"error": f"moved_to target {moved_to_text} does not exist"}
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
                 previous = task.get("status")
                 cli.set_status(data, task_id, status, moved_to_text)
                 cli.save_todo(data, todo_path)

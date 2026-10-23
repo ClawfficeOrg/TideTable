@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hub writes carry a base and a stale one is refused.** `POST /api/<slug>/start`, `/done`, `/reset` and `/status` took a `base` (the hub's event count when the caller decided) and answered `409 {"conflict": true, "task", "base", "current"}` when that task changed after it, without applying the write. A duplicate `done` still returned `already_done`.
+- **`POST /api/<slug>/reset` no longer ran blind.** It required a `base` (428 without one) and refused another owner's live claim with a 409 unless `force` was set.
+- `tidetable --server` sent `--base N` when given, else fetched the hub's current base just before the write; `reset --force` reached the hub.
+
+### Added
+
+- **Conflict list.** The hub appended every refused write to `<todo>.conflicts.jsonl`, read by `GET /api/<slug>/conflicts` and the read-only `tidetable conflicts <slug>`; nothing replayed them.
+- **`GET /api/<slug>/base`** returned the hub's current event count for a slug.
+
 ## [0.12.0] — 2026-10-17
 
 ### Added

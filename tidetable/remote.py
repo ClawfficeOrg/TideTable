@@ -33,6 +33,7 @@ ROUTES = {
     "parallel": ("GET", "parallel"),
     "deps": ("GET", "deps"),
     "history": ("GET", "history"),
+    "conflicts": ("GET", "conflicts"),
     "look-queue": ("GET", "look-queue"),
     "sidebar": ("GET", "sidebar"),
     "start": ("POST", "start"),
@@ -42,6 +43,9 @@ ROUTES = {
     "add": ("POST", "add"),
     "add-phase": ("POST", "add-phase"),
 }
+
+#: writes that carry a base: the hub event count the caller decided against.
+BASED = {"start", "done", "reset", "status"}
 
 #: commands that take a todo file but have no hub route.
 LOCAL_ONLY = {"convert", "release"}
@@ -103,6 +107,8 @@ def build_request(args) -> tuple[str, str, dict]:
             body["changelog"] = args.changelog
     elif cmd == "reset":
         body = {"task": args.task_id, "owner": _owner(args), **extras}
+        if getattr(args, "force", False):
+            body["force"] = True
     elif cmd == "status":
         body = {"task": args.task_id, "status": args.status, "owner": _owner(args), **extras}
         if args.moved_to:
@@ -122,9 +128,22 @@ def build_request(args) -> tuple[str, str, dict]:
             if value:
                 body[key] = value
 
+    if cmd in BASED and getattr(args, "base", None) is not None:
+        body["base"] = args.base
+
     if query:
         path += "?" + urllib.parse.urlencode(query)
     return method, path, body
+
+
+def fetch_base(base_url: str, slug: str, bearer: str) -> int:
+    """The hub's current event count for `slug`, for a write decided right now."""
+    path = f"/api/{urllib.parse.quote(slug, safe='')}/base"
+    status, payload = request(base_url, "GET", path, {}, bearer)
+    if status != 200 or not isinstance(payload.get("base"), int):
+        message = payload.get("error") or f"HTTP {status}"
+        raise RemoteError(f"cannot read the hub base for {slug}: {message}")
+    return payload["base"]
 
 
 def request(base: str, method: str, path: str, body: dict, bearer: str,
@@ -173,7 +192,18 @@ def run(args) -> int:
     if not base.startswith(("http://", "https://")):
         raise RemoteError(f"server must be an http(s) URL, got {base!r}")
     method, path, body = build_request(args)
+    if args.command in BASED and "base" not in body:
+        # No --base: this call is being decided now, so now is its base. A queued
+        # write must not take this path; it passes the base it saw with --base.
+        body["base"] = fetch_base(base, args.todo_file, token(args))
     status, payload = request(base, method, path, body, token(args))
+    if status == 409 and payload.get("conflict"):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        print(f"Error: conflict: task {payload.get('task')} changed on the hub since base "
+              f"{payload.get('base')} (now {payload.get('current')}); the write was not "
+              f"applied and is on the conflict list (`tidetable conflicts {args.todo_file}`).",
+              file=sys.stderr)
+        return 1
     # Reads that legitimately answer "nothing" carry their payload on a 404/422.
     expected_shape = (args.command == "next" and "task" in payload) or \
         (args.command == "validate" and "ok" in payload)
