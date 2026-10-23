@@ -33,6 +33,9 @@ _WRITE_LOCK = threading.Lock()
 #: locked reload-mutate-write path as the CLI. Presence lives in
 #: tidetable.sessions (1.1.3); per-project machine tokens in
 #: tidetable.tokens (1.4.1).
+#: most bytes read from an unauthenticated request body before answering 401/403.
+_UNAUTH_DRAIN_LIMIT = 64 * 1024
+
 ROUTES: dict[tuple[str, str], str] = {
     ("GET", "/api/projects"): "cmd_list",
     ("GET", "/api/{slug}/ready"): "cmd_ready",
@@ -1049,6 +1052,18 @@ class _Handler(BaseHTTPRequestHandler):
             tokens_db=getattr(self.server, "tokens_db", None),
         )
         if not ok:
+            # Drain the request body first: closing with it unread makes the kernel reset the
+            # connection, and a POST client then sees ECONNRESET instead of the 401/403.
+            # The read is capped because the caller is unauthenticated; a larger body is
+            # left unread and the connection closed, which is the old behaviour.
+            try:
+                length = max(0, int(self.headers.get("Content-Length", "0") or "0"))
+                if length <= _UNAUTH_DRAIN_LIMIT:
+                    self.rfile.read(length)
+                else:
+                    self.close_connection = True
+            except (ValueError, OSError):
+                pass
             self.send_response(403 if forbidden else 401)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
