@@ -1207,8 +1207,50 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ValueError):
             pass
 
+    def _admin_mint_token(self) -> None:
+        """``POST /api/admin/tokens``: mint a machine token for one project.
+
+        Admin only: the shared ``TK_API_TOKEN``. A machine token cannot mint
+        more machine tokens, so a leaked project token cannot widen itself.
+        """
+        from tidetable import mint as mint_cli
+
+        expected = os.environ.get("TK_API_TOKEN", "")
+        presented = _extract_presented(self.headers)  # type: ignore[arg-type]
+        try:
+            length = max(0, int(self.headers.get("Content-Length", "0") or "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(min(length, 65536)) if length else b""
+        if not expected or not presented or not hmac.compare_digest(presented, expected):
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw.strip() else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"error": "invalid JSON body"})
+            return
+        registry = getattr(self.server, "registry", DEFAULT_REGISTRY)
+        request, reason = mint_cli.validate_request(body, mint_cli.registry_slugs(registry))
+        if reason:
+            self._send_json(400, {"error": reason})
+            return
+        tokens_db = getattr(self.server, "tokens_db", None) or _resolve_tokens_db(registry)
+        tokens_store.init_db(tokens_db)
+        _, token, _ = tokens_store.mint_token(
+            tokens_db, request["slugs"], request["scopes"], request["days"])
+        self._send_json(201, {
+            "token": token,
+            "slugs": request["slugs"],
+            "scopes": request["scopes"],
+            "expires_days": request["days"],
+        })
+
     def _handle(self) -> None:
         raw_path = urlsplit(self.path).path
+        if self.command == "POST" and raw_path == "/api/admin/tokens":
+            self._admin_mint_token()
+            return
         route, slug = match_route(self.command, raw_path)
         if route is None:
             # Auth first so scanners cannot probe the route table unauthenticated.
