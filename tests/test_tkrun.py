@@ -472,6 +472,18 @@ class TKRunRunTests(unittest.TestCase):
         s.run("done", "--hours", "1", STUB_ENVDUMP=str(dump), KEEP_ME="1")
         self.assertEqual(dump.read_text(), "")
 
+    def test_gate_steps_do_not_see_runner_credentials(self):
+        s = self.scratch()
+        dump = s.root.parent / "gate-envdump.txt"
+        names = ("TIDETABLE_TOKEN", "TIDETABLE_SERVER", "TASKERKEEPER_TOKEN", "TASKERKEEPER_SERVER", "TK_API_TOKEN")
+        probe = ("import os,pathlib; pathlib.Path(%r).write_text(','.join(sorted(k for k in os.environ "
+                 "if k in %r)))" % (str(dump), names))
+        s.set_config({"gate": [{"cmd": [sys.executable, "-c", probe]}], "review": {"enabled": False}})
+        dump.unlink(missing_ok=True)
+        s.run("done", "--hours", "1", TIDETABLE_TOKEN="tk-secret", TK_API_TOKEN="tk-api")
+        self.assertTrue(dump.exists(), "gate step did not run")
+        self.assertEqual(dump.read_text(), "")
+
     def test_prompt_forbids_printing_secrets_and_env_dumps_are_denied(self):
         s = self.scratch()
         code, out = s.run("done", "--hours", "1", "--dry-run")

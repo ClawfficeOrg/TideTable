@@ -1376,7 +1376,8 @@ REVIEW_RESULT: FAIL <short reasons, ';'-separated>
         gate_log = self.run_dir / f"{tid}-gate.txt"
         for name, cmd, cwd, bad in steps:
             self.say(f"gate: {name}")
-            r = run_proc(cmd, cwd, timeout=self.gate_sec, env=self.job_env or None)
+            r = run_proc(cmd, cwd, timeout=self.gate_sec, env=self.job_env or None,
+                         drop=AGENT_ENV_DROP + list(self.cfg["agent_env_drop"]))
             with open(gate_log, "a", encoding="utf-8") as f:
                 f.write(f"== {name} exit {r.code}\n{r.out}\n{r.err}\n")
             if r.timed_out:
@@ -1864,7 +1865,8 @@ TKRUN_SUMMARY: <one line, imperative, <= 72 chars: what you did>
         for p in conflicted:
             if git(self.root, "checkout", "--ours", "--", p).code:
                 return False
-            r = run_proc(list(rules[p]), self.root, timeout=600)
+            r = run_proc(list(rules[p]), self.root, timeout=600,
+                         drop=AGENT_ENV_DROP + list(self.cfg["agent_env_drop"]))
             if r.code:
                 self.log(f"WARN {tid}: regenerating {p} failed: {(r.out + r.err).strip()[-200:]}")
                 return False
