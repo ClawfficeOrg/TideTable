@@ -457,6 +457,23 @@ class TKRunRunTests(unittest.TestCase):
         self.assertIn("END (interrupted (Ctrl-C))", log)
         self.assertNotIn("END (no more ready tasks)", log)
 
+    def test_events_file_gets_one_json_line_per_claim_gate_and_outcome(self):
+        import json as _json
+        s = self.scratch()
+        events = s.root.parent / "events.jsonl"
+        code, _ = s.run("done", "--hours", "1", "--events", str(events), "--run-id", "run-123")
+        self.assertEqual(code, 0)
+        rows = [_json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+        kinds = [r["kind"] for r in rows]
+        self.assertIn("claim", kinds)
+        self.assertIn("gate", kinds)
+        self.assertIn("outcome", kinds)
+        self.assertTrue(all(r["run_id"] == "run-123" for r in rows))
+        gate = next(r for r in rows if r["kind"] == "gate")
+        self.assertEqual(gate["passed"], True)
+        outcome = next(r for r in rows if r["kind"] == "outcome")
+        self.assertEqual(outcome["outcome"], "done")
+
     def test_runner_credentials_are_not_in_the_agent_environment(self):
         s = self.scratch()
         dump = s.root.parent / "envdump.txt"

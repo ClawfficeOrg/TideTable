@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -243,6 +244,9 @@ STACKS = {
         "shell_deny": ["go install*"],
     },
 }
+
+
+_EVENTS_LOCK = threading.Lock()  # serialises --events appends
 
 
 # ── process + git helpers ────────────────────────────────────────────────────
@@ -608,6 +612,8 @@ class Runner:
     sib_start: dict = field(default_factory=dict)
     main_sha: str = ""
     log_enabled: bool = False
+    events_file: str = ""            # --events: one JSON line per claim, gate and outcome
+    run_id: str = ""                 # --run-id: stamped on every event line
 
     # derived paths / names
     def __post_init__(self):
@@ -758,6 +764,17 @@ class Runner:
     # ── logging
     def say(self, msg: str) -> None:
         print(f"[tkrun] {msg}", flush=True)
+
+    def emit(self, kind: str, task: str | None = None, **fields) -> None:
+        """Append one JSON event line when `--events` is set. Safe to call from job threads."""
+        if not self.events_file:
+            return
+        record = {"ts": datetime.now().isoformat(timespec="seconds"), "run_id": self.run_id,
+                  "kind": kind, **({"task": task} if task else {}), **fields}
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with _EVENTS_LOCK:
+            with open(self.events_file, "a", encoding="utf-8") as f:
+                f.write(line)
 
     def log(self, msg: str) -> None:
         self.say(msg)
@@ -1578,6 +1595,7 @@ TKRUN_SUMMARY: <one line, imperative, <= 72 chars: what you did>
             self.log(f"SKIP {tid} - claim failed: {r.out}{r.err}")
             return "skipped"
         self.log(f"START {tid} '{task.get('title', '')}' agent={spec}")
+        self.emit("claim", tid, agent=spec)
 
         head0 = git(self.root, "rev-parse", "HEAD").out.strip()
         run = self.run_agent(provider, model, lambda resume: self.build_prompt(task, spec, resume), tid)
@@ -1630,6 +1648,7 @@ TKRUN_SUMMARY: <one line, imperative, <= 72 chars: what you did>
         why = self.gate(tid, changed, sib_changed)
         if why:
             why, changed, sib_changed = self.repair_gate(task, why, head0, changed, sib_changed)
+        self.emit("gate", tid, passed=not why, detail=why or "")
         if why:
             self.park_failure(task, f"gate: {why}")
             return "failed"
@@ -1950,6 +1969,7 @@ TKRUN_SUMMARY: <one line, imperative, <= 72 chars: what you did>
                         stopping = stopping or "STOP while waiting out a usage limit"
                         outcome = "skipped"
                     outcome = self.integrate(t, job, outcome, crashed)
+                    self.emit("outcome", t["id"], outcome=outcome)
                     counts[outcome] += 1
                     if outcome == "done" and self.phase_enabled:
                         if self.review_phase(t["id"]) == "FAIL" and self.phase_on_fail == "stop":
@@ -1974,6 +1994,7 @@ TKRUN_SUMMARY: <one line, imperative, <= 72 chars: what you did>
                 return "no more ready tasks"
             tried.append(t["id"])
             outcome = self.run_task(t)
+            self.emit("outcome", t["id"], outcome=outcome)
             if outcome == "stop":
                 return "STOP while waiting out a usage limit"
             counts[outcome] += 1
@@ -2124,7 +2145,8 @@ def cmd_run(args) -> int:
                     only=list(args.task or []),
                     no_phase_review=args.no_phase_review,
                     follow=sys.stdout.isatty() if args.follow is None else args.follow,
-                    base_override=args.base or "", hub=hub)
+                    base_override=args.base or "", hub=hub,
+                    events_file=args.events or "", run_id=args.run_id or uuid.uuid4().hex[:12])
     if path is None:
         runner.say("no .tidetable/tkrun.json; using detected stack defaults "
                    "(`tidetable tkrun init` writes one)")
@@ -2222,6 +2244,10 @@ def add_parser(sub) -> None:
     run.add_argument("--hours", type=float, default=None, help="Time budget (default 8; 0 with --minutes)")
     run.add_argument("--minutes", type=float, default=0, help="Added to --hours (alone = minutes only)")
     run.add_argument("--dry-run", action="store_true", help="Show routing, command and prompt; change nothing")
+    run.add_argument("--events", metavar="PATH",
+                     help="Append one JSON line per claim, gate result and outcome to PATH")
+    run.add_argument("--run-id", metavar="ID",
+                     help="Id stamped on every event line (default: a random id)")
     run.add_argument("--model", help="Force provider/model for every task")
     run.add_argument("--review-model", "--task-review-model", dest="review_model",
                      help="Override the per-task reviewer (provider/model)")
