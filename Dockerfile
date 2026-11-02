@@ -1,6 +1,13 @@
 # Core API for the VPS hub: `tidetable serve`. The todo files and registry are
 # a mounted volume, never baked into the image.
 FROM python:3.12-slim
+# Trust store hardening: install the current `ca-certificates` so the image
+# does not trust the compromised eMudhra roots ("emSign ECC Root CA - G3" /
+# "AAA Certificate Services") -- eMudhra intermediate CA compromise, 2026-10-20.
+# See https://emudhra.we-have-a-problem.com
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
 

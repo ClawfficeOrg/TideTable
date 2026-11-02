@@ -284,10 +284,14 @@ with `TIDETABLE_EVENTS=0`.
 and the read-only dashboard. It is the single writer: GET routes
 (`ready`, `next`, `list`, `deps`, `history`, `look-queue`, `validate`, `parallel`) call the
 CLI functions and return the `--json` shapes; POST routes (`start`, `done`,
-`reset`, `status`, `add`) hold a server lock plus `FileLock`, reload inside
-the lock, and enforce claim leases. `POST /api/<slug>/heartbeat` records agent
+`reset`, `status`, `add`, `add-phase`, `edit`, `look-defer`, `look-clear`) hold a server lock plus
+`FileLock`, reload inside the lock, and enforce claim leases. `look-clear` takes a
+`reject` body flag (`tidetable look-clear SLUG ID --reject` over `--server`) to send the
+task back to `pending` instead of `done`. `POST /api/<slug>/heartbeat` records agent
 presence (repo, branch, task) with a 180s staleness horizon, and
-`GET /api/stream` replays the event log as SSE. Auth is a shared
+`GET /api/stream` replays the event log as SSE. `GET /api/projects` lists the
+registry's slugs and names, filtered to the projects the presented machine
+token may open (the shared `TK_API_TOKEN` sees all). Auth is a shared
 `TK_API_TOKEN` bearer today, per-project machine tokens
 (`tidetable/tokens.py`) next. Postgres (`deploy/migrations/001_init.sql`)
 is a read projection tailed by `tidetable/projector.py`, never a scheduler.
@@ -311,7 +315,7 @@ the only file it writes is the review-tick sidecar `.tidetable/review-ticks.json
 | --- | --- | --- |
 | `tidetable tui docs/todo.json` | that file, through the `tidetable` CLI (always `--local`) | start, done, defer, clear, reject |
 | `tidetable tui` | the first `todo*.json` the CLI finds | same |
-| `tidetable tui my-slug --server URL` (or `$TIDETABLE_SERVER`) | the hub project, with live updates on its event stream | start and done only; the hub has no routes for the rest |
+| `tidetable tui my-slug --server URL` (or `$TIDETABLE_SERVER`) | the hub project, with live updates on its event stream | start, done, defer, clear, reject |
 | any of the above plus `--local` | forces local even when `$TIDETABLE_SERVER` is exported | local set |
 
 Claims and finishes use one owner: `--owner`, else `$TIDETABLE_OWNER`, else `tui@<host>`. A task started by someone else must be finished by them, or by running the TUI with their `--owner`.
@@ -352,12 +356,17 @@ notes only; `c` is what clears an item.
 **Hub.** `tidetable-tui --server URL SLUG` (or `$TIDETABLE_SERVER` and `$TIDETABLE_TOKEN`;
 prefer the environment, since `--token` shows in process listings; `--local` ignores an
 exported server) reads the same routes as `tidetable --server`, plus
-`GET /api/<slug>/look-queue`. It refreshes on the hub's `/api/stream` events, else polls
+`GET /api/<slug>/look-queue`. The slug resolves in this order: the positional argument,
+`$TIDETABLE_PROJECT`, a `slug` key in the nearest `.tidetable/config.json`, then a picker
+over `GET /api/projects` (j/k, Enter; an empty list says what to do). It never reads git
+remotes. It refreshes on the hub's `/api/stream` events, else polls
 every 2 s, and the footer shows `✓ live` or `· polling`. If the hub drops, the last data
 stays on screen dimmed with `⊘ offline · retry Ns · data Nm old`, and retries back off
-2, 4, 8, 16, 30 s. The token only travels in the `Authorization` header and is never shown,
-logged or stored. Over the hub only `d` is available; clear, reject and defer have no hub
-route yet. Local mode refreshes when the todo or its `.events.jsonl` changes, else every 5 s.
+2, 4, 8, 16, 30 s. A 401 or 403 does not retry: the footer says
+`token rejected · set $TIDETABLE_TOKEN` or `no access to this project · ask for a scoped
+token`. In-progress rows show the owner, claim age and `lease … left`. The token only
+travels in the `Authorization` header and is never shown, logged or stored. Local mode
+refreshes when the todo or its `.events.jsonl` changes, else every 5 s.
 
 **Palettes.** `--palette NAME` or `$TIDETABLE_PALETTE`: `biolume` (default), `deep-tide`,
 `sea-glass`, `phosphor`, `boiled`, vendored from clawffice-design. Colour depth falls
@@ -489,6 +498,25 @@ tidetable add my-todo.json --phase 7.1 \
 
 The new ID is the phase's highest sequence number plus one. Unknown
 prerequisites are rejected rather than written.
+
+### Editing a Task
+
+```bash
+tidetable edit my-todo.json 7.1.1 \
+  --title "Add structured logging" \
+  --success "Logs include level and timestamp" \
+  --tests "cargo test --quiet"
+tidetable edit my-todo.json 7.1.1 --clear-parallel-group
+```
+
+Only the fields named on the command line change; status and claims are never
+touched, and `updated_at` moves. List flags (`--prereq`, `--touches`,
+`--success`) replace the whole list, and `--clear-touches`, `--clear-success`,
+`--clear-prereq`, `--clear-tests`, `--clear-parallel-group` empty or remove one.
+A dangling prerequisite, a self-prerequisite or a cycle is refused and nothing
+is written. The edit is recorded as one `edit` event carrying the changed field
+names. Over HTTP: `POST /api/<slug>/edit` with `task` plus the same field names;
+a JSON `null` clears a list or an optional scalar.
 
 ### Adding Phases
 

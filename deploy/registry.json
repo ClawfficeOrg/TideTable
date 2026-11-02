@@ -6,6 +6,13 @@
       "repo_url": "https://github.com/ClawfficeOrg/TideTable",
       "todo_path": "projects/tidetable/todo.json",
       "default_branch": "main"
+    },
+    {
+      "slug": "chiton",
+      "name": "Chiton",
+      "repo_url": "https://github.com/ClawfficeOrg/chiton",
+      "todo_path": "projects/chiton/todo.json",
+      "default_branch": "main"
     }
   ]
 }

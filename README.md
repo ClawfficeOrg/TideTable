@@ -54,6 +54,7 @@ and is never defaulted.
 | `parallel <file>` | Parallel groups, marking which members are runnable now |
 | `deps <file> <id>` | What a task waits on and what it unblocks |
 | `add <file> --phase <id> --title <t>` | Append a task. Accepts `--goal`, `--prereq` (repeatable), `--complexity`, `--agent`, `--parallel-group`, `--touches`, `--success` |
+| `edit <file> <id> [flags]` | Change a task's plan fields (`--title`, `--goal`, `--prereq`, `--complexity`, `--agent`, `--parallel-group`, `--touches`, `--success`, `--tests`) and clear lists with `--clear-touches`/`--clear-success`/`--clear-prereq`/`--clear-tests`/`--clear-parallel-group`. Never touches status or claims; a dangling or cyclic prerequisite is refused. Also `POST /api/<slug>/edit` |
 | `add-phase <file> --phase <id> --title <t>` | Insert a phase (`--goal`, `--prereq` repeatable phase IDs, `--after`/`--before` anchor; also `POST /api/<slug>/add-phase`) |
 | `release <file> [phase]` | The tag a completed phase ships as. Prints it by default; `--tag` actually creates it |
 | `history <file>` | Replay the append-only event log. `--task <id>` filters, `--limit N` tails |
@@ -272,13 +273,18 @@ checked at all.
 
 `tidetable tui` opens a ratatui front end (Now / Upcoming / Done / Review) for a todo file
 or a hub project. It is a separate binary, not part of the wheel, and it never writes a todo
-file: actions go through the CLI or the hub.
+file: actions go through the CLI or the hub, and every action (start, done, defer, clear,
+reject) works in both modes.
 
 ```bash
 cargo build --release --manifest-path tui/Cargo.toml     # Rust 1.88+
 tidetable tui [--mode auto|standard|side|bottom] [--tmux] [-- docs/todo.json --read-only]
 tidetable-tui --server https://hub.example myproj        # token from $TIDETABLE_TOKEN
 ```
+
+In hub mode the project slug comes from the positional argument, `$TIDETABLE_PROJECT`, a
+`slug` key in the nearest `.tidetable/config.json`, or a picker over `GET /api/projects`.
+The picker and the project list are scoped to the token.
 
 Keys: `j`/`k` move, `Tab`/`1`-`4` views, `Space` tick a review criterion, `s` start (Upcoming), `d` done, `l` defer,
 `c` clear, `x` reject, `r` refresh, `q` quit. `--read-only` removes the action keys.

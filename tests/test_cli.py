@@ -316,6 +316,87 @@ class AddTest(unittest.TestCase):
             self.assertEqual(reload(path)["phases"][0]["tasks"][-1]["id"], "1.0.1")
 
 
+class EditTest(unittest.TestCase):
+    def test_edit_changes_only_named_fields_and_keeps_claims(self):
+        with TempTodo(todo(phase(
+            "1.0",
+            task("1.0.1", status="in_progress", goal="old", touches=["old/"],
+                 claimed_by="a", claimed_at="2026-10-17T00:00:00Z",
+                 lease_expires_at="2026-10-17T01:00:00Z"),
+            task("1.0.2"),
+        ))) as path:
+            code, out = run("edit", path, "1.0.1",
+                            "--title", "Better", "--goal", "new goal",
+                            "--touches", "a/", "--touches", "b/",
+                            "--success", "it works", "--tests", "make test",
+                            "--complexity", "High", "--agent", "flagship",
+                            "--parallel-group", "grp", "--prereq", "1.0.2")
+            self.assertEqual(code, 0, out)
+            edited = reload(path)["phases"][0]["tasks"][0]
+            self.assertEqual(edited["title"], "Better")
+            self.assertEqual(edited["goal"], "new goal")
+            self.assertEqual(edited["touches"], ["a/", "b/"])
+            self.assertEqual(edited["success"], ["it works"])
+            self.assertEqual(edited["tests"], "make test")
+            self.assertEqual(edited["complexity"], "High")
+            self.assertEqual(edited["agent"], "flagship")
+            self.assertEqual(edited["parallel_group"], "grp")
+            self.assertEqual(edited["prerequisites"], ["1.0.2"])
+            self.assertEqual(edited["status"], "in_progress")
+            self.assertEqual(edited["claimed_by"], "a")
+            self.assertEqual(edited["lease_expires_at"], "2026-10-17T01:00:00Z")
+            self.assertTrue(edited["updated_at"].endswith("Z"))
+
+    def test_clear_flags_empty_lists_and_remove_optional_scalars(self):
+        with TempTodo(todo(phase("1.0", task(
+                "1.0.1", prerequisites=["1.0.2"], touches=["x/"],
+                success=["ok"], tests="make", parallel_group="grp"),
+                task("1.0.2")))) as path:
+            code, out = run("edit", path, "1.0.1", "--clear-touches",
+                            "--clear-success", "--clear-prereq",
+                            "--clear-tests", "--clear-parallel-group")
+            self.assertEqual(code, 0, out)
+            task_out = reload(path)["phases"][0]["tasks"][0]
+            self.assertEqual(task_out["touches"], [])
+            self.assertEqual(task_out["success"], [])
+            self.assertEqual(task_out["prerequisites"], [])
+            self.assertNotIn("tests", task_out)
+            self.assertNotIn("parallel_group", task_out)
+
+    def test_nothing_to_edit_is_an_error(self):
+        with TempTodo(todo(phase("1.0", task("1.0.1")))) as path:
+            code, out = run("edit", path, "1.0.1")
+            self.assertEqual(code, 1)
+            self.assertIn("nothing to edit", out)
+
+    def test_dangling_or_self_prerequisite_is_refused_without_writing(self):
+        with TempTodo(todo(phase("1.0", task("1.0.1"), task("1.0.2")))) as path:
+            code, out = run("edit", path, "1.0.1", "--title", "Nope",
+                            "--prereq", "9.9.9")
+            self.assertEqual(code, 1)
+            self.assertIn("does not exist", out)
+            self.assertEqual(reload(path)["phases"][0]["tasks"][0]["title"], "Task 1.0.1")
+            code, out = run("edit", path, "1.0.1", "--prereq", "1.0.1")
+            self.assertEqual(code, 1)
+            self.assertIn("cannot require itself", out)
+
+    def test_a_prerequisite_cycle_is_refused(self):
+        with TempTodo(todo(phase("1.0", task("1.0.1", prerequisites=["1.0.2"]),
+                                 task("1.0.2")))) as path:
+            code, out = run("edit", path, "1.0.2", "--prereq", "1.0.1")
+            self.assertEqual(code, 1)
+            self.assertIn("cycle", out.lower())
+            self.assertNotIn("prerequisites", reload(path)["phases"][0]["tasks"][1])
+
+    def test_edit_appends_an_event(self):
+        with TempTodo(todo(phase("1.0", task("1.0.1")))) as path:
+            self.assertEqual(run("edit", path, "1.0.1", "--goal", "g2")[0], 0)
+            events = json.loads(run("history", path, "--task", "1.0.1", "--json")[1])["events"]
+            edit = [e for e in events if e.get("event") == "edit"][-1]
+            self.assertEqual(edit["task"], "1.0.1")
+            self.assertEqual(edit["fields"], ["goal"])
+
+
 class AddPhaseTest(unittest.TestCase):
     def test_add_phase_appends_by_default(self):
         with TempTodo(todo(phase("1.0", task("1.0.1")))) as path:
@@ -399,6 +480,88 @@ class AddPhaseTest(unittest.TestCase):
                 "/api/{slug}/add-phase", "demo",
                 {"phase": "1.1", "title": "Dup"}, registry, db)
             self.assertEqual(dup, 409)
+
+
+class LookHubTest(unittest.TestCase):
+    """serve.py's POST look-defer/look-clear routes, unit-level."""
+
+    def _setup(self, tmp, data):
+        todo_path = str(Path(tmp) / "todo.json")
+        Path(todo_path).write_text(json.dumps(data), encoding="utf-8")
+        registry = str(Path(tmp) / "registry.json")
+        Path(registry).write_text(json.dumps({"projects": [
+            {"slug": "demo", "name": "Demo", "repo_url": "",
+             "todo_path": todo_path, "default_branch": "main"},
+        ]}), encoding="utf-8")
+        db = str(Path(tmp) / "sessions.db")
+        return todo_path, registry, db
+
+    def test_look_defer_queues_task_and_keeps_note(self):
+        with TemporaryDirectory() as tmp:
+            todo_path, registry, db = self._setup(
+                tmp, todo(phase("1.0", task("1.0.1", "in_progress"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-defer", "demo",
+                {"task": "1.0.1", "note": "check it", "owner": "agent"},
+                registry, db)
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["to"], "needs_human_look")
+            data = json.loads(Path(todo_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["phases"][0]["tasks"][0]["status"], "needs_human_look")
+            self.assertEqual(data["phases"][0]["tasks"][0]["human_look"], "check it")
+
+    def test_look_defer_already_done_is_a_no_op(self):
+        with TemporaryDirectory() as tmp:
+            todo_path, registry, db = self._setup(
+                tmp, todo(phase("1.0", task("1.0.1", "done"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-defer", "demo", {"task": "1.0.1"}, registry, db)
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["already_done"])
+            data = json.loads(Path(todo_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["phases"][0]["tasks"][0]["status"], "done")
+
+    def test_look_defer_missing_task_is_404(self):
+        with TemporaryDirectory() as tmp:
+            _, registry, db = self._setup(tmp, todo(phase("1.0", task("1.0.1"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-defer", "demo", {"task": "9.9.9"}, registry, db)
+            self.assertEqual(status, 404)
+            self.assertEqual(payload["error"], "task 9.9.9 not found")
+
+    def test_look_clear_marks_done_and_drops_note(self):
+        with TemporaryDirectory() as tmp:
+            todo_path, registry, db = self._setup(
+                tmp, todo(phase("1.0", task("1.0.1", "needs_human_look",
+                                           human_look="check it"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-clear", "demo", {"task": "1.0.1"}, registry, db)
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["to"], "done")
+            data = json.loads(Path(todo_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["phases"][0]["tasks"][0]["status"], "done")
+            self.assertNotIn("human_look", data["phases"][0]["tasks"][0])
+
+    def test_look_clear_reject_returns_to_pending(self):
+        with TemporaryDirectory() as tmp:
+            todo_path, registry, db = self._setup(
+                tmp, todo(phase("1.0", task("1.0.1", "needs_human_look"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-clear", "demo", {"task": "1.0.1", "reject": True},
+                registry, db)
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["to"], "pending")
+            data = json.loads(Path(todo_path).read_text(encoding="utf-8"))
+            self.assertEqual(data["phases"][0]["tasks"][0]["status"], "pending")
+
+    def test_look_clear_refuses_task_not_in_queue(self):
+        with TemporaryDirectory() as tmp:
+            _, registry, db = self._setup(tmp, todo(phase("1.0", task("1.0.1"))))
+            status, payload = serve.handle_post(
+                "/api/{slug}/look-clear", "demo", {"task": "1.0.1"}, registry, db)
+            self.assertEqual(status, 409)
+            self.assertEqual(payload["error"], "task 1.0.1 is pending, not needs_human_look")
+
 
 class OutputTest(unittest.TestCase):
     def test_next_json_is_parseable(self):
@@ -1200,9 +1363,10 @@ class TestServeHeartbeat(unittest.TestCase):
             registry, db = self._registry(tmp)
             serve.handle_post("/api/{slug}/start", "demo",
                               {"task": "1.0.1", "owner": "worker-1"}, registry, db)
+            base = serve.handle_get("/api/{slug}/base", "demo", {}, registry, db)[1]["base"]
             status, _ = serve.handle_post(
-                "/api/{slug}/reset", "demo", {"task": "1.0.1", "owner": "worker-1"},
-                registry, db)
+                "/api/{slug}/reset", "demo",
+                {"task": "1.0.1", "owner": "worker-1", "base": base}, registry, db)
             self.assertEqual(status, 200)
             row = sessions.get_session(db, "worker-1")
             assert row is not None
@@ -1224,6 +1388,251 @@ class TestServeHeartbeat(unittest.TestCase):
                 "/api/{slug}/sessions", "demo", {}, registry, db)
             self.assertEqual(status, 200)
             self.assertEqual(len(payload["sessions"]), 1)
+
+
+class TestHubBase(unittest.TestCase):
+    """Hub writes carry a base; a stale one is refused with 409 onto the conflict list."""
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.todo_path = str(root / "todo.json")
+        Path(self.todo_path).write_text(json.dumps(todo(
+            phase("1.0", task("1.0.1"), task("1.0.2")))), encoding="utf-8")
+        self.registry = str(root / "registry.json")
+        Path(self.registry).write_text(json.dumps({"projects": [
+            {"slug": "demo", "name": "Demo", "repo_url": "",
+             "todo_path": self.todo_path, "default_branch": "main"}]}), encoding="utf-8")
+        self.db = str(root / "sessions.db")
+
+    def post(self, route: str, body: dict) -> tuple[int, dict]:
+        return serve.handle_post(f"/api/{{slug}}/{route}", "demo", body, self.registry, self.db)
+
+    def get(self, route: str) -> tuple[int, dict]:
+        return serve.handle_get(f"/api/{{slug}}/{route}", "demo", {}, self.registry, self.db)
+
+    def base(self) -> int:
+        status, payload = self.get("base")
+        self.assertEqual(status, 200)
+        return payload["base"]
+
+    def statuses(self) -> dict:
+        return {t["id"]: t["status"] for t in reload(self.todo_path)["phases"][0]["tasks"]}
+
+    def test_base_counts_events(self):
+        self.assertEqual(self.base(), 0)
+        self.assertEqual(self.post("start", {"task": "1.0.1", "owner": "a"})[0], 200)
+        self.assertEqual(self.base(), 1)
+
+    def test_stale_base_done_is_rejected_and_recorded(self):
+        seen = self.base()
+        self.assertEqual(self.post("start", {"task": "1.0.1", "owner": "a"})[0], 200)
+        status, payload = self.post("done", {"task": "1.0.1", "owner": "b",
+                                             "base": seen, "force": True})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"conflict": True, "task": "1.0.1", "base": 0, "current": 1})
+        self.assertEqual(self.statuses()["1.0.1"], "in_progress")
+        status, listed = self.get("conflicts")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listed["conflicts"]), 1)
+        entry = listed["conflicts"][0]
+        self.assertEqual((entry["route"], entry["task"], entry["owner"], entry["base"],
+                          entry["current"]), ("done", "1.0.1", "b", 0, 1))
+        self.assertEqual(entry["changed_by"][0]["event"], "start")
+        self.assertTrue(listed["path"].endswith("todo.json.conflicts.jsonl"))
+
+    def test_change_to_another_task_is_not_a_conflict(self):
+        seen = self.base()
+        self.post("start", {"task": "1.0.2", "owner": "a"})
+        status, _ = self.post("done", {"task": "1.0.1", "owner": "b", "base": seen})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_base_beyond_the_log_is_a_conflict(self):
+        status, payload = self.post("done", {"task": "1.0.1", "owner": "a", "base": 99})
+        self.assertEqual((status, payload["current"]), (409, 0))
+
+    def test_bad_base_is_a_400(self):
+        for bad in ("x", -1, True):
+            status, _ = self.post("done", {"task": "1.0.1", "owner": "a", "base": bad})
+            self.assertEqual(status, 400, bad)
+
+    def test_duplicate_done_still_returns_already_done(self):
+        seen = self.base()
+        self.assertEqual(self.post("done", {"task": "1.0.1", "owner": "a", "base": seen})[0], 200)
+        status, payload = self.post("done", {"task": "1.0.1", "owner": "a", "base": seen})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["already_done"])
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_reset_needs_a_base(self):
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        status, _ = self.post("reset", {"task": "1.0.1", "owner": "a"})
+        self.assertEqual(status, 428)
+        self.assertEqual(self.statuses()["1.0.1"], "in_progress")
+
+    def test_stale_base_reset_is_rejected_while_claimed(self):
+        seen = self.base()
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        status, payload = self.post("reset", {"task": "1.0.1", "owner": "b", "base": seen})
+        self.assertEqual(status, 409)
+        self.assertTrue(payload["conflict"])
+        self.assertEqual(self.statuses()["1.0.1"], "in_progress")
+        self.assertEqual(self.get("conflicts")[1]["conflicts"][0]["route"], "reset")
+
+    def test_fresh_base_reset_still_refuses_another_owners_live_claim(self):
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        status, payload = self.post("reset", {"task": "1.0.1", "owner": "b",
+                                              "base": self.base()})
+        self.assertEqual(status, 409)
+        self.assertIn("held by a", payload["error"])
+        self.assertNotIn("conflict", payload)
+        self.assertEqual(self.statuses()["1.0.1"], "in_progress")
+        status, _ = self.post("reset", {"task": "1.0.1", "owner": "b",
+                                        "base": self.base(), "force": True})
+        self.assertEqual(status, 200)
+
+    def test_holder_resets_its_own_claim_with_a_fresh_base(self):
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        status, _ = self.post("reset", {"task": "1.0.1", "owner": "a", "base": self.base()})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.statuses()["1.0.1"], "pending")
+
+    def test_stale_base_status_and_start_are_rejected(self):
+        seen = self.base()
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        status, _ = self.post("status", {"task": "1.0.1", "status": "cancelled",
+                                         "owner": "b", "base": seen})
+        self.assertEqual(status, 409)
+        status, _ = self.post("start", {"task": "1.0.1", "owner": "a", "base": seen})
+        self.assertEqual(status, 409)
+        self.assertEqual(len(self.get("conflicts")[1]["conflicts"]), 2)
+
+    def test_conflicts_are_never_replayed(self):
+        seen = self.base()
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        self.post("done", {"task": "1.0.1", "owner": "b", "base": seen, "force": True})
+        self.post("done", {"task": "1.0.2", "owner": "a", "base": self.base()})
+        self.assertEqual(self.statuses()["1.0.1"], "in_progress")
+        self.assertEqual(len(self.get("conflicts")[1]["conflicts"]), 1)
+
+    def tasks(self) -> dict:
+        return {t["id"]: t for t in reload(self.todo_path)["phases"][0]["tasks"]}
+
+    def test_stale_base_edit_is_rejected_and_recorded(self):
+        seen = self.base()
+        self.assertEqual(self.post("edit", {"task": "1.0.1", "owner": "a", "title": "A"})[0], 200)
+        status, payload = self.post("edit", {"task": "1.0.1", "owner": "b", "title": "B",
+                                             "touches": None, "base": seen})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"conflict": True, "task": "1.0.1", "base": 0, "current": 1})
+        self.assertEqual(self.tasks()["1.0.1"]["title"], "A")
+        self.assertEqual(len(cli.read_events(self.todo_path)), 1)
+        conflicts = self.get("conflicts")[1]["conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        entry = conflicts[0]
+        self.assertEqual((entry["route"], entry["task"], entry["owner"], entry["base"],
+                          entry["current"]), ("edit", "1.0.1", "b", 0, 1))
+        self.assertEqual(entry["changed_by"][0]["event"], "edit")
+        # A null is a --clear-* to edit; the record must still show it.
+        self.assertIn("touches", entry["request"])
+        self.assertIsNone(entry["request"]["touches"])
+
+    def test_current_base_edit_succeeds(self):
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        status, payload = self.post("edit", {"task": "1.0.1", "owner": "a", "title": "New",
+                                             "base": self.base()})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["changed"], ["title"])
+        self.assertEqual(self.tasks()["1.0.1"]["title"], "New")
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_bad_base_on_edit_and_look_is_a_400(self):
+        for route in ("edit", "look-defer", "look-clear"):
+            status, _ = self.post(route, {"task": "1.0.1", "owner": "a", "title": "X",
+                                          "base": "x"})
+            self.assertEqual(status, 400, route)
+        self.assertEqual(self.statuses()["1.0.1"], "pending")
+
+    def test_edit_and_look_without_a_base_behave_like_start(self):
+        # start/done/status skip the check when no base is sent; so do these.
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        self.assertEqual(self.post("edit", {"task": "1.0.1", "owner": "a", "goal": "g"})[0], 200)
+        self.assertEqual(self.post("look-defer", {"task": "1.0.1", "owner": "a"})[0], 200)
+        self.assertEqual(self.post("look-clear", {"task": "1.0.1", "owner": "a"})[0], 200)
+        self.assertEqual(self.statuses()["1.0.1"], "done")
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_stale_base_look_defer_is_rejected_and_recorded(self):
+        seen = self.base()
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        status, payload = self.post("look-defer", {"task": "1.0.1", "owner": "b",
+                                                   "note": "eyeball", "base": seen})
+        self.assertEqual(status, 409)
+        self.assertEqual(payload, {"conflict": True, "task": "1.0.1", "base": 0, "current": 1})
+        self.assertEqual(self.statuses()["1.0.1"], "in_progress")
+        self.assertNotIn("human_look", self.tasks()["1.0.1"])
+        conflicts = self.get("conflicts")[1]["conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual((conflicts[0]["route"], conflicts[0]["owner"],
+                          conflicts[0]["request"]["note"]), ("look-defer", "b", "eyeball"))
+
+    def test_stale_base_look_clear_is_rejected_and_recorded(self):
+        seen = self.base()
+        self.post("look-defer", {"task": "1.0.1", "owner": "a", "note": "check it"})
+        for reject in (False, True):
+            status, payload = self.post("look-clear", {"task": "1.0.1", "owner": "b",
+                                                       "reject": reject, "base": seen})
+            self.assertEqual(status, 409, reject)
+            self.assertEqual(payload, {"conflict": True, "task": "1.0.1",
+                                       "base": 0, "current": 1})
+        self.assertEqual(self.statuses()["1.0.1"], "needs_human_look")
+        self.assertEqual(self.tasks()["1.0.1"]["human_look"], "check it")
+        conflicts = self.get("conflicts")[1]["conflicts"]
+        self.assertEqual([c["route"] for c in conflicts], ["look-clear", "look-clear"])
+        self.assertEqual(conflicts[0]["changed_by"][0]["event"], "look_defer")
+
+    def test_current_base_look_defer_and_clear_succeed(self):
+        status, payload = self.post("look-defer", {"task": "1.0.1", "owner": "a",
+                                                   "base": self.base()})
+        self.assertEqual((status, payload["to"]), (200, "needs_human_look"))
+        status, payload = self.post("look-clear", {"task": "1.0.1", "owner": "a",
+                                                   "base": self.base()})
+        self.assertEqual((status, payload["to"]), (200, "done"))
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_duplicate_look_clear_keeps_its_plain_409(self):
+        self.post("look-defer", {"task": "1.0.1", "owner": "a"})
+        seen = self.base()
+        self.assertEqual(self.post("look-clear", {"task": "1.0.1", "owner": "a",
+                                                  "base": seen})[0], 200)
+        # The retry's base is now stale, but it is still the old not-in-queue refusal.
+        status, payload = self.post("look-clear", {"task": "1.0.1", "owner": "a", "base": seen})
+        self.assertEqual(status, 409)
+        self.assertNotIn("conflict", payload)
+        self.assertEqual(payload["error"], "task 1.0.1 is done, not needs_human_look")
+        self.assertEqual(self.statuses()["1.0.1"], "done")
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_look_defer_on_a_done_task_stays_a_no_op_with_a_stale_base(self):
+        seen = self.base()
+        self.post("done", {"task": "1.0.1", "owner": "a"})
+        status, payload = self.post("look-defer", {"task": "1.0.1", "owner": "a", "base": seen})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["already_done"])
+        self.assertEqual(self.get("conflicts")[1]["conflicts"], [])
+
+    def test_conflicts_cli_reads_the_list_locally(self):
+        seen = self.base()
+        self.post("start", {"task": "1.0.1", "owner": "a"})
+        self.post("done", {"task": "1.0.1", "owner": "b", "base": seen})
+        code, out = run("--local", "conflicts", self.todo_path, "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["conflicts"][0]["task"], "1.0.1")
+        code, out = run("--local", "conflicts", self.todo_path)
+        self.assertEqual(code, 0)
+        self.assertIn("1.0.1", out)
 
 
 class TestServeStream(unittest.TestCase):
@@ -1476,6 +1885,7 @@ class TestRemoteClient(unittest.TestCase):
         server.registry = registry
         server.sessions_db = str(root / "sessions.db")
         server.tokens_db = str(root / "tokens.db")
+        self.tokens_db = server.tokens_db
         self.thread = threading.Thread(target=server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(server.server_close)
@@ -1518,6 +1928,79 @@ class TestRemoteClient(unittest.TestCase):
             cli.main(["look-queue", self.todo_path, "--json"])
         self.assertEqual(json.loads(out), json.loads(local.getvalue()))
         self.assertEqual([q["id"] for q in json.loads(out)["queue"]], ["1.0.1"])
+
+    def test_look_defer_then_clear_matches_local_effect(self):
+        local_copy = str(Path(self.tmp.name) / "local.json")
+        Path(local_copy).write_text(
+            Path(self.todo_path).read_text(encoding="utf-8"), encoding="utf-8")
+
+        code, out, _ = self.run_cli("look-defer", "demo", "1.0.1", "--note", "check it")
+        self.assertEqual(code, 0, out)
+        run("look-defer", local_copy, "1.0.1", "--note", "check it")
+
+        hub = reload(self.todo_path)["phases"][0]["tasks"][0]
+        local = reload(local_copy)["phases"][0]["tasks"][0]
+        self.assertEqual(hub["status"], local["status"])
+        self.assertEqual(hub["status"], "needs_human_look")
+        self.assertEqual(hub["human_look"], local["human_look"])
+
+        code, out, _ = self.run_cli("look-clear", "demo", "1.0.1")
+        self.assertEqual(code, 0, out)
+        run("look-clear", local_copy, "1.0.1")
+
+        hub = reload(self.todo_path)["phases"][0]["tasks"][0]
+        local = reload(local_copy)["phases"][0]["tasks"][0]
+        self.assertEqual(hub["status"], "done")
+        self.assertEqual(local["status"], "done")
+        self.assertNotIn("human_look", hub)
+        self.assertNotIn("human_look", local)
+
+    def test_look_clear_reject_matches_local_effect(self):
+        data = reload(self.todo_path)
+        data["phases"][0]["tasks"][0]["status"] = "needs_human_look"
+        data["phases"][0]["tasks"][0]["human_look"] = "check it"
+        Path(self.todo_path).write_text(json.dumps(data), encoding="utf-8")
+        local_copy = str(Path(self.tmp.name) / "local-reject.json")
+        Path(local_copy).write_text(json.dumps(data), encoding="utf-8")
+
+        code, out, _ = self.run_cli("look-clear", "demo", "1.0.1", "--reject")
+        self.assertEqual(code, 0, out)
+        run("look-clear", local_copy, "1.0.1", "--reject")
+
+        hub = reload(self.todo_path)["phases"][0]["tasks"][0]
+        local = reload(local_copy)["phases"][0]["tasks"][0]
+        self.assertEqual(hub["status"], "pending")
+        self.assertEqual(local["status"], "pending")
+
+    def test_look_clear_refusal_matches_local_wording(self):
+        # 1.0.1 is plain "pending", not queued for a human look.
+        code, out, err = self.run_cli("look-clear", "demo", "1.0.1")
+        self.assertEqual(code, 1)
+        local_code, local_out = run("look-clear", self.todo_path, "1.0.1")
+        self.assertEqual(local_code, 1)
+        self.assertIn(local_out.strip(), err)
+
+    def test_look_defer_not_found_matches_local_wording(self):
+        code, out, err = self.run_cli("look-defer", "demo", "9.9.9")
+        self.assertEqual(code, 1)
+        local_code, local_out = run("look-defer", self.todo_path, "9.9.9")
+        self.assertEqual(local_code, 1)
+        self.assertIn(local_out.strip(), err)
+
+    def test_look_defer_auth_401_and_403(self):
+        from tidetable import tokens as tokens_store
+
+        # The base fetch now goes first and refuses as loudly as the write would.
+        code, out, err = self.run_cli("look-defer", "demo", "1.0.1", token="")
+        self.assertEqual(code, 1)
+        self.assertIn("unauthorized", out + err)
+        self.assertEqual(reload(self.todo_path)["phases"][0]["tasks"][0]["status"], "pending")
+
+        _, presented, _ = tokens_store.mint_token(self.tokens_db, ["other"], ["read", "write"])
+        code, out, err = self.run_cli("look-defer", "demo", "1.0.1", token=presented)
+        self.assertEqual(code, 1)
+        self.assertIn("forbidden", out + err)
+        self.assertEqual(reload(self.todo_path)["phases"][0]["tasks"][0]["status"], "pending")
 
     def test_sidebar_matches_local_json_and_renders_text_without_it(self):
         code, out, _ = self.run_cli("sidebar", "demo", "--json", "--width", "60", "--height", "20")
@@ -1576,6 +2059,31 @@ class TestRemoteClient(unittest.TestCase):
             code, _, _ = self.run_cli("list", "demo", server="http://127.0.0.1:1")
         self.assertEqual(code, 1)
 
+    def test_edit_over_the_wire_changes_only_named_fields(self):
+        self.assertEqual(self.run_cli("start", "demo", "1.0.1", "--owner", "w")[0], 0)
+        code, out, _ = self.run_cli("edit", "demo", "1.0.1", "--title", "New",
+                                    "--touches", "src/", "--clear-success")
+        self.assertEqual(code, 0, out)
+        payload = json.loads(out)
+        self.assertEqual(payload["changed"], ["success", "title", "touches"])
+        self.assertEqual(payload["task"]["status"], "in_progress")
+        tasks = {t["id"]: t for t in
+                 json.loads(Path(self.todo_path).read_text(encoding="utf-8"))["phases"][0]["tasks"]}
+        self.assertEqual(tasks["1.0.1"]["title"], "New")
+        self.assertEqual(tasks["1.0.1"]["touches"], ["src/"])
+        self.assertEqual(tasks["1.0.1"]["success"], [])
+        self.assertEqual(tasks["1.0.1"]["claimed_by"], "w")
+
+    def test_edit_refusal_keeps_the_local_wording(self):
+        code, out, err = self.run_cli("edit", "demo", "1.0.1", "--prereq", "9.9.9")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("prerequisite 9.9.9 does not exist", err)
+        local = io.StringIO()
+        with redirect_stdout(local):
+            self.assertEqual(
+                cli.main(["edit", self.todo_path, "1.0.1", "--prereq", "9.9.9"]), 1)
+        self.assertIn("prerequisite 9.9.9 does not exist", local.getvalue())
+
     def test_add_phase_over_the_wire(self):
         code, out, _ = self.run_cli("add-phase", "demo", "--phase", "2.0",
                                     "--title", "Next", "--prereq", "1.0", "--after", "1.0")
@@ -1594,10 +2102,96 @@ class TestRemoteClient(unittest.TestCase):
                 code = cli.main(["--local", "list", self.todo_path, "--json"])
             self.assertEqual(code, 0)
 
+    def test_stale_base_over_the_wire_is_a_conflict_and_listed(self):
+        self.assertEqual(self.run_cli("start", "demo", "1.0.1", "--owner", "a")[0], 0)
+        code, out, err = self.run_cli("done", "demo", "1.0.1", "--owner", "b",
+                                      "--force", "--base", "0")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out), {"conflict": True, "task": "1.0.1",
+                                           "base": 0, "current": 1})
+        self.assertIn("conflict", err)
+        code, out, _ = self.run_cli("conflicts", "demo")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["conflicts"][0]["owner"], "b")
+
+    def test_stale_base_edit_and_look_over_the_wire_are_conflicts(self):
+        self.assertEqual(self.run_cli("start", "demo", "1.0.1", "--owner", "a")[0], 0)
+        for argv in (("edit", "demo", "1.0.1", "--title", "B"),
+                     ("look-defer", "demo", "1.0.1")):
+            code, out, err = self.run_cli(*argv, "--owner", "b", "--base", "0")
+            self.assertEqual(code, 1, argv)
+            self.assertEqual(json.loads(out), {"conflict": True, "task": "1.0.1",
+                                               "base": 0, "current": 1})
+            self.assertIn("conflict", err)
+        # look-clear only reaches the base check for a task in the look queue.
+        self.assertEqual(self.run_cli("look-defer", "demo", "1.0.1", "--owner", "a")[0], 0)
+        code, out, err = self.run_cli("look-clear", "demo", "1.0.1", "--owner", "b",
+                                      "--base", "1")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out), {"conflict": True, "task": "1.0.1",
+                                           "base": 1, "current": 2})
+        self.assertIn("conflict", err)
+        code, out, _ = self.run_cli("conflicts", "demo")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([c["route"] for c in json.loads(out)["conflicts"]],
+                         ["edit", "look-defer", "look-clear"])
+
+    def test_edit_and_look_without_base_fetch_one_and_apply(self):
+        self.assertEqual(self.run_cli("start", "demo", "1.0.1", "--owner", "a")[0], 0)
+        for argv in (("edit", "demo", "1.0.1", "--goal", "g"),
+                     ("look-defer", "demo", "1.0.1"),
+                     ("look-clear", "demo", "1.0.1")):
+            code, out, _ = self.run_cli(*argv, "--owner", "a")
+            self.assertEqual(code, 0, (argv, out))
+        code, out, _ = self.run_cli("conflicts", "demo")
+        self.assertEqual(json.loads(out)["conflicts"], [])
+
+    def test_reset_without_base_fetches_one_and_refuses_a_live_claim(self):
+        self.assertEqual(self.run_cli("start", "demo", "1.0.1", "--owner", "a")[0], 0)
+        code, _, err = self.run_cli("reset", "demo", "1.0.1", "--owner", "b")
+        self.assertEqual(code, 1)
+        self.assertIn("held by a", err)
+        code, out, _ = self.run_cli("reset", "demo", "1.0.1", "--owner", "a")
+        self.assertEqual(code, 0, out)
+
+    def test_401_on_a_write_is_an_error_not_a_fallback(self):
+        before = Path(self.todo_path).read_text(encoding="utf-8")
+        # Both the base fetch and the write itself refuse a bad token loudly.
+        for extra in ((), ("--base", "0")):
+            code, out, err = self.run_cli("done", "demo", "1.0.1", *extra, token="nope")
+            self.assertEqual(code, 1, extra)
+            self.assertIn("unauthorized", out + err)
+            self.assertEqual(Path(self.todo_path).read_text(encoding="utf-8"), before)
+
     def test_commands_without_a_hub_route_are_refused(self):
         code, out, _ = self.run_cli("convert", "demo")
         self.assertEqual(code, 1)
         self.assertIn("no remote mode", out)
+
+    def test_project_list_is_scoped_to_the_token(self):
+        import urllib.request
+
+        from tidetable import tokens
+
+        registry = Path(self.tmp.name) / "registry.json"
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        data["projects"].append({
+            "slug": "other", "name": "Other", "repo_url": "",
+            "todo_path": self.todo_path, "default_branch": "main",
+        })
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        db = str(Path(self.tmp.name) / "tokens.db")
+        _, scoped, _ = tokens.mint_token(db, ["demo"], ["read"])
+
+        def slugs(token: str) -> list[str]:
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            req = urllib.request.Request(self.url + "/api/projects", headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                payload = json.load(resp)
+            return [p["slug"] for p in payload["projects"]]
+
+        self.assertEqual(slugs(scoped), ["demo"])
+        self.assertEqual(slugs(self.TOKEN), ["demo", "other"])
 
     def test_build_request_maps_flags_to_query_and_body(self):
         from tidetable import remote
@@ -1613,3 +2207,25 @@ class TestRemoteClient(unittest.TestCase):
             ["add", "demo", "--phase", "1.0", "--title", "T", "--prereq", "a", "--prereq", "b"])
         _, _, body = remote.build_request(args)
         self.assertEqual(body["prerequisites"], ["a", "b"])
+        args = cli.build_parser().parse_args(
+            ["edit", "demo", "1.0.1", "--title", "T", "--touches", "a/",
+             "--clear-success", "--clear-tests"])
+        method, path, body = remote.build_request(args)
+        self.assertEqual((method, path), ("POST", "/api/demo/edit"))
+        self.assertEqual(body["task"], "1.0.1")
+        self.assertEqual(body["title"], "T")
+        self.assertEqual(body["touches"], ["a/"])
+        self.assertIsNone(body["success"])
+        self.assertIsNone(body["tests"])
+        args = cli.build_parser().parse_args(
+            ["look-defer", "demo", "1.0.1", "--note", "check it"])
+        method, path, body = remote.build_request(args)
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/api/demo/look-defer")
+        self.assertEqual(body["task"], "1.0.1")
+        self.assertEqual(body["note"], "check it")
+        args = cli.build_parser().parse_args(["look-clear", "demo", "1.0.1", "--reject"])
+        method, path, body = remote.build_request(args)
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/api/demo/look-clear")
+        self.assertIs(body["reject"], True)

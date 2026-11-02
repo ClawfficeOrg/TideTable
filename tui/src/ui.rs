@@ -100,6 +100,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         f.buffer_mut()
             .set_style(body, Style::new().add_modifier(Modifier::DIM));
         draw_offline(f, app, area);
+    } else if app.is_denied() {
+        // Nothing to dim: the label carries the only useful information.
+        draw_offline(f, app, area);
     }
     draw_toast(f, app, area);
     draw_dialog(f, app, area);
@@ -248,7 +251,7 @@ fn draw_standard(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let hints = app.hints();
-    let label = if app.is_offline() {
+    let label = if app.is_offline() || app.is_denied() {
         None
     } else {
         app.conn_label()
@@ -447,6 +450,43 @@ fn draw_state(f: &mut Frame, app: &App, area: Rect) {
                 "Press a number to open one.",
                 app.theme.dim(),
             )));
+            f.render_widget(
+                Paragraph::new(lines).block(Block::new().padding(Padding::new(2, 2, 1, 0))),
+                area,
+            );
+            return;
+        }
+        Load::PickProjects(projects) => {
+            let mut lines = vec![Line::from(Span::styled(
+                "Choose a project",
+                app.theme.strong(),
+            ))];
+            lines.push(Line::from(""));
+            if projects.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "This token can see no projects on the hub.",
+                    app.theme.base(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "Ask for a token scoped to a project, or pass its slug on the command line.",
+                    app.theme.dim(),
+                )));
+            } else {
+                for (i, (slug, name)) in projects.iter().enumerate() {
+                    let selected = i == app.pick_sel;
+                    let marker = if selected { "► " } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, app.theme.accent_style()),
+                        Span::styled(format!("{slug} "), app.theme.accent_style()),
+                        Span::styled(name.clone(), app.theme.base()),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "j/k or arrows to move, Enter to open.",
+                    app.theme.dim(),
+                )));
+            }
             f.render_widget(
                 Paragraph::new(lines).block(Block::new().padding(Padding::new(2, 2, 1, 0))),
                 area,

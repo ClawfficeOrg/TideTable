@@ -14,7 +14,8 @@ use tidetable_tui::ui;
 
 const USAGE: &str = "usage: tidetable-tui [TODO_FILE | SLUG] [--mode auto|standard|side|bottom] [--palette NAME]\n\
                      \x20                   [--read-only] [--owner NAME] [--server URL] [--token TOKEN] [--local]\n\
-                     hub: with --server (or $TIDETABLE_SERVER) the argument is the project slug;\n\
+                     hub: with --server (or $TIDETABLE_SERVER) the argument is the project slug,\n\
+                     else $TIDETABLE_PROJECT, then .tidetable/config.json \"slug\", then a picker;\n\
                      prefer $TIDETABLE_TOKEN over --token, which shows up in process listings";
 
 struct Args {
@@ -86,25 +87,51 @@ impl Source for Backend {
     }
 }
 
-/// One snapshot into the app. `true` when the data is fresh.
-fn refresh(app: &mut App, source: &mut Backend) -> bool {
+/// What one refresh attempt did; `Denied` must halt the retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refreshed {
+    /// A snapshot is on screen (or a picker was opened).
+    Ok,
+    /// Transient: keep the last snapshot and retry with backoff.
+    Stale,
+    /// 401/403: retrying cannot help.
+    Denied { forbidden: bool },
+    /// No data and no retry value (local failure).
+    Failed,
+}
+
+/// One snapshot into the app.
+fn refresh(app: &mut App, source: &mut Backend) -> Refreshed {
     app.now_epoch = now_epoch();
     match source.snapshot() {
         Ok(s) => {
             app.set_snapshot(s);
             app.last_ok = Some(app.now_epoch);
-            true
+            Refreshed::Ok
         }
         Err(SourceError::Pick(files)) => {
             app.load = Load::Pick(files);
-            true
+            Refreshed::Ok
+        }
+        Err(SourceError::Auth { forbidden, message }) => {
+            app.load = Load::Failed(message);
+            Refreshed::Denied { forbidden }
         }
         // A hub that drops out keeps the last snapshot on screen; the footer says it is stale.
-        Err(_) if matches!(source, Backend::Hub(_)) && app.load == Load::Ready => false,
+        Err(_) if matches!(source, Backend::Hub(_)) && app.load == Load::Ready => Refreshed::Stale,
         Err(e) => {
             app.load = Load::Failed(e.to_string());
-            false
+            Refreshed::Failed
         }
+    }
+}
+
+/// Feed one attempt into the poll/backoff state. Local failures keep polling.
+fn note(refresher: &mut Refresher, outcome: Refreshed, hub: bool, now: Instant) {
+    match outcome {
+        Refreshed::Denied { forbidden } => refresher.deny(forbidden),
+        Refreshed::Ok => refresher.record(true, now),
+        Refreshed::Stale | Refreshed::Failed => refresher.record(!hub, now),
     }
 }
 
@@ -143,26 +170,56 @@ fn main() {
 
     let owner = Some(tidetable_tui::source::default_owner(args.owner.clone()));
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (rx, mut source) = match &server {
+    let mut projects_picker: Option<Vec<(String, String)>> = None;
+    let (mut rx, mut source) = match &server {
         Some(url) => {
-            let Some(slug) = args.file.clone() else {
-                eprintln!("hub mode needs a project slug\n{USAGE}");
-                std::process::exit(2);
-            };
             let http = |t: Option<String>| UreqHttp::new(url, t);
-            let (main_http, stream_http) = match (http(token.clone()), http(token.clone())) {
-                (Ok(a), Ok(b)) => (a, b),
-                (Err(e), _) | (_, Err(e)) => {
-                    eprintln!("{e}");
-                    std::process::exit(2);
+            let configured = tidetable_tui::slug::resolve(
+                args.file.clone(),
+                env("TIDETABLE_PROJECT"),
+                tidetable_tui::slug::config_slug(&cwd),
+            );
+            match configured {
+                Some(slug) => {
+                    let (main_http, stream_http) = match (http(token.clone()), http(token.clone()))
+                    {
+                        (Ok(a), Ok(b)) => (a, b),
+                        (Err(e), _) | (_, Err(e)) => {
+                            eprintln!("{e}");
+                            std::process::exit(2);
+                        }
+                    };
+                    let (tx, rx) = mpsc::channel();
+                    spawn_stream(stream_http, slug.clone(), tx);
+                    (
+                        Some(rx),
+                        Backend::Hub(HubSource::new(main_http, slug).with_owner(owner.clone())),
+                    )
                 }
-            };
-            let (tx, rx) = mpsc::channel();
-            spawn_stream(stream_http, slug.clone(), tx);
-            (
-                Some(rx),
-                Backend::Hub(HubSource::new(main_http, slug).with_owner(owner.clone())),
-            )
+                None => {
+                    // No slug anywhere: list what this token can see and let the user pick.
+                    let main_http = match http(token.clone()) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(2);
+                        }
+                    };
+                    match tidetable_tui::hub::list_projects(&main_http) {
+                        Ok(projects) => projects_picker = Some(projects),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(2);
+                        }
+                    }
+                    (
+                        None,
+                        Backend::Hub(
+                            HubSource::new(main_http, String::new()).with_owner(owner.clone()),
+                        ),
+                    )
+                }
+            }
         }
         None => {
             let mut local =
@@ -173,17 +230,24 @@ fn main() {
             (None, Backend::Local(local))
         }
     };
-    let hub = rx.is_some();
+    let mut hub = server.is_some();
     let mut app = App::new(theme, args.mode, Ticks::load(&cwd));
     app.read_only = args.read_only;
     app.motion = motion::enabled(|k| std::env::var(k).ok());
+    if let Some(projects) = projects_picker.take() {
+        app.load = Load::PickProjects(projects);
+    }
 
     // ratatui::init installs a panic hook that restores the terminal.
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     let _ = terminal.draw(|f| draw(f, &mut app));
     let mut refresher = Refresher::new(hub, Instant::now());
-    refresher.record(refresh(&mut app, &mut source) || !hub, Instant::now());
+    let picking = matches!(app.load, Load::PickProjects(_));
+    if !picking {
+        let outcome = refresh(&mut app, &mut source);
+        note(&mut refresher, outcome, hub, Instant::now());
+    }
     let mut watcher = Watcher::default();
     let mut dirty = true;
 
@@ -220,6 +284,10 @@ fn main() {
                     StreamMsg::Connected => refresher.set_stream(true),
                     StreamMsg::Changed => pushed = true,
                     StreamMsg::Disconnected | StreamMsg::Unsupported => refresher.set_stream(false),
+                    StreamMsg::Denied { forbidden } => {
+                        refresher.set_stream(false);
+                        refresher.deny(forbidden);
+                    }
                 }
             }
         } else if !app.snap.todo_file.is_empty() {
@@ -239,10 +307,36 @@ fn main() {
             }
             app.want_refresh = true;
         }
-        if app.want_refresh || refresher.due(now, pushed) {
+        if let Some(slug) = app.chosen_slug.take() {
+            let url = server.clone().unwrap_or_default();
+            match (
+                UreqHttp::new(&url, token.clone()),
+                UreqHttp::new(&url, token.clone()),
+            ) {
+                (Ok(main_http), Ok(stream_http)) => {
+                    let (tx, new_rx) = mpsc::channel();
+                    spawn_stream(stream_http, slug.clone(), tx);
+                    source =
+                        Backend::Hub(HubSource::new(main_http, slug).with_owner(owner.clone()));
+                    rx = Some(new_rx);
+                    hub = true;
+                    app.load = Load::Loading;
+                    app.want_refresh = true;
+                    refresher = Refresher::new(hub, Instant::now());
+                    dirty = true;
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    app.load = Load::Failed(e);
+                    dirty = true;
+                }
+            }
+        }
+        if !matches!(app.load, Load::PickProjects(_))
+            && (app.want_refresh || refresher.due(now, pushed))
+        {
             app.want_refresh = false;
-            let ok = refresh(&mut app, &mut source);
-            refresher.record(ok || !hub, Instant::now());
+            let outcome = refresh(&mut app, &mut source);
+            note(&mut refresher, outcome, hub, Instant::now());
             dirty = true;
         }
         let conn = refresher.conn(Instant::now());

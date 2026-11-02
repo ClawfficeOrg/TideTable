@@ -48,8 +48,11 @@ from tidetable.jsonio import (
     env_get,
     FileLock,
     LockTimeout,
+    append_conflict,
     append_event,
+    conflicts_path,
     events_path,
+    read_conflicts,
     read_events,
     read_json,
     write_json,
@@ -684,6 +687,35 @@ def add_task(data: dict, phase_id: str, title: str, **fields) -> dict | None:
     return None
 
 PHASE_ID_RE = re.compile(r"^[0-9]+\.[0-9]+$")
+
+#: Fields `edit_task` accepts. Status is deliberately absent: use `status`/`start`/`done`.
+EDITABLE_TASK_FIELDS = ("title", "goal", "touches", "success", "prerequisites",
+                        "complexity", "agent", "tests", "parallel_group")
+LIST_TASK_FIELDS = ("touches", "success", "prerequisites")
+
+
+def edit_task(data: dict, task_id: str, **fields) -> dict | None:
+    """Change plan fields on one task, in place. Returns it, or None when unknown.
+
+    Only the keys passed are touched, so an edit never resets status, claims or
+    timestamps it was not asked about. A list field is replaced wholesale (an
+    empty list clears it); ``None`` removes an optional scalar such as
+    ``tests`` or ``parallel_group``.
+    """
+    _, task = find_task(data, task_id)
+    if task is None:
+        return None
+    for key, value in fields.items():
+        if key not in EDITABLE_TASK_FIELDS:
+            raise ValueError(f"not an editable task field: {key}")
+        if key in LIST_TASK_FIELDS:
+            task[key] = [str(v) for v in (value or [])]
+        elif value is None:
+            task.pop(key, None)
+        else:
+            task[key] = value
+    task["updated_at"] = utc_now()
+    return task
 
 
 def add_phase(data: dict, phase_id: str, title: str, **fields) -> dict | None:
@@ -1513,6 +1545,59 @@ def cmd_add(args) -> int:
     return 0
 
 
+def cmd_edit(args) -> int:
+    updates: dict = {}
+    for key in ("title", "goal", "tests", "complexity", "agent", "parallel_group"):
+        value = getattr(args, key)
+        if value is not None:
+            updates[key] = value
+    for key in ("touches", "success", "prereq"):
+        values = getattr(args, key)
+        if values is not None:
+            updates["prerequisites" if key == "prereq" else key] = values
+    if args.clear_touches:
+        updates["touches"] = []
+    if args.clear_success:
+        updates["success"] = []
+    if args.clear_prereq:
+        updates["prerequisites"] = []
+    if args.clear_tests:
+        updates["tests"] = None
+    if args.clear_parallel_group:
+        updates["parallel_group"] = None
+    if not updates:
+        print("Error: nothing to edit; pass at least one field")
+        return 1
+
+    lock = FileLock(args.todo_file)
+    with lock:
+        report_lock(lock)
+        data = load_todo(args.todo_file)
+        _, task = find_task(data, args.task_id)
+        if task is None:
+            print(f"Error: task {args.task_id} not found")
+            return 1
+        if args.task_id in updates.get("prerequisites", []):
+            print(f"Error: task {args.task_id} cannot require itself")
+            return 1
+        for dep in updates.get("prerequisites", []):
+            if find_task(data, dep)[1] is None:
+                print(f"Error: prerequisite {dep} does not exist")
+                return 1
+        before, _ = semantic_errors(data)
+        edit_task(data, args.task_id, **updates)
+        after, _ = semantic_errors(data)
+        introduced = [e for e in after if e not in before]
+        if introduced:
+            print(f"Error: edit rejected: {'; '.join(introduced)}")
+            return 1
+        save_todo(data, args.todo_file)
+        record_event(args.todo_file, "edit", task=args.task_id,
+                     owner=args.owner or default_owner(), fields=sorted(updates))
+    print(f"✓ Edited task {args.task_id}: {', '.join(sorted(updates))}")
+    return 0
+
+
 def cmd_add_phase(args) -> int:
     if not PHASE_ID_RE.match(args.phase):
         print(f"Error: invalid phase id {args.phase} (want MAJOR.MINOR, e.g. 7.2)")
@@ -1665,6 +1750,23 @@ def cmd_history(args) -> int:
     return 0
 
 
+def cmd_conflicts(args) -> int:
+    """List the writes the hub refused as stale. Read-only: resolving one is a person's call."""
+    conflicts = read_conflicts(args.todo_file)
+    if args.json:
+        emit_json({"path": str(conflicts_path(args.todo_file)), "conflicts": conflicts})
+        return 0
+    if not conflicts:
+        print(f"No conflicts recorded in {conflicts_path(args.todo_file).name}")
+        return 0
+    print(f"Conflicts — {conflicts_path(args.todo_file).name}")
+    print("═" * 62)
+    for c in conflicts:
+        print(f"  {c.get('at', '?')}  {c.get('route', '?'):<8} {c.get('task', ''):<10}"
+              f"  base {c.get('base')} < {c.get('current')}  [{c.get('owner', '-')}]")
+    return 0
+
+
 def cmd_validate(args) -> int:
     return 0 if validate_todo(args.todo_file, schema_only=args.schema_only) else 1
 
@@ -1775,6 +1877,15 @@ def build_parser() -> argparse.ArgumentParser:
                             "(default: $TIDETABLE_OWNER, else host:pid)")
         return p
 
+    def add_base(p):
+        # Hub only. A queued write must pass the base it saw when it decided; the
+        # fetch-on-send default only suits a call made the moment it was decided.
+        p.add_argument("--base", type=int, metavar="N",
+                       help="With --server: the hub event count this write was decided "
+                            "against; the hub refuses it if the task changed since "
+                            "(default: the hub's current count, fetched just before)")
+        return p
+
     p = add_command("validate", "Schema + semantic validation")
     p.add_argument("--schema-only", action="store_true", help="Skip the semantic checks")
     p.set_defaults(func=cmd_validate)
@@ -1792,22 +1903,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "or anything in progress — safe to fan out as a set")
     p.set_defaults(func=cmd_ready)
 
-    p = add_owner(add_command("start", "Claim a task (-> in_progress)",
-                              task_id=True, json_out=True))
+    p = add_base(add_owner(add_command("start", "Claim a task (-> in_progress)",
+                                       task_id=True, json_out=True)))
     p.add_argument("--force", action="store_true", help="Start despite unmet prerequisites")
     p.add_argument("--lease", type=int, metavar="MINUTES",
                    help=f"How long the claim holds (default: "
                         f"$TIDETABLE_LEASE_MINUTES, else {DEFAULT_LEASE_MINUTES})")
     p.set_defaults(func=cmd_start)
 
-    p = add_owner(add_command("done", "Mark a task done", task_id=True, json_out=True))
+    p = add_base(add_owner(add_command("done", "Mark a task done", task_id=True,
+                                       json_out=True)))
     p.add_argument("--force", action="store_true",
                    help="Finish despite unmet prerequisites or someone else's claim")
     p.add_argument("--changelog", help="Changelog line for this task")
     p.set_defaults(func=cmd_done)
 
-    p = add_owner(add_command("look-defer", "Queue a task for a human look (counts as done)",
-                              task_id=True))
+    p = add_base(add_owner(add_command("look-defer", "Queue a task for a human look (counts as done)",
+                                       task_id=True)))
     p.add_argument("--note", help="What the human should check")
     p.set_defaults(func=cmd_look_defer)
 
@@ -1816,14 +1928,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="List each task's success criteria as a checklist")
     p.set_defaults(func=cmd_look_queue)
 
-    p = add_owner(add_command("look-clear", "A human looked: task -> done", task_id=True))
+    p = add_base(add_owner(add_command("look-clear", "A human looked: task -> done", task_id=True)))
     p.add_argument("--reject", action="store_true", help="The check failed: back to pending")
     p.set_defaults(func=cmd_look_clear)
 
-    p = add_owner(add_command("reset", "Return a task to pending", task_id=True))
+    p = add_base(add_owner(add_command("reset", "Return a task to pending", task_id=True)))
+    p.add_argument("--force", action="store_true",
+                   help="With --server: reset even while another owner's lease is live")
     p.set_defaults(func=cmd_reset)
 
-    p = add_owner(add_command("status", "Set an arbitrary status", task_id=True))
+    p = add_base(add_owner(add_command("status", "Set an arbitrary status", task_id=True)))
     p.add_argument("status", choices=VALID_STATUSES)
     p.add_argument("--moved-to", dest="moved_to", help="Target task ID (required for moved)")
     p.set_defaults(func=cmd_status)
@@ -1851,6 +1965,32 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Success criterion (repeatable)")
     p.set_defaults(func=cmd_add)
 
+    p = add_base(add_owner(add_command("edit", "Change a task's plan fields", task_id=True)))
+    p.add_argument("--title", help="New title")
+    p.add_argument("--goal", help="New goal")
+    p.add_argument("--complexity", choices=["Low", "Medium", "High", "Very High"])
+    p.add_argument("--agent", choices=["basic_dev_agent", "mid_dev_agent", "pro_dev_agent", "flagship"])
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--touches", action="append", metavar="PATH",
+                       help="Owned path (repeatable; replaces the whole list)")
+    group.add_argument("--clear-touches", action="store_true", help="Clear owned paths")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--success", action="append", metavar="CRITERION",
+                       help="Success criterion (repeatable; replaces the whole list)")
+    group.add_argument("--clear-success", action="store_true", help="Clear success criteria")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--prereq", action="append", metavar="TASK_ID",
+                       help="Prerequisite task ID (repeatable; replaces the whole list)")
+    group.add_argument("--clear-prereq", action="store_true", help="Drop every prerequisite")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--tests", help="Command that verifies the task")
+    group.add_argument("--clear-tests", action="store_true", help="Remove the tests field")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--parallel-group", dest="parallel_group", help="Parallel group name")
+    group.add_argument("--clear-parallel-group", action="store_true",
+                       help="Remove the parallel group label")
+    p.set_defaults(func=cmd_edit)
+
     p = add_command("add-phase", "Insert a new phase")
     p.add_argument("--phase", required=True, help="New phase ID (MAJOR.MINOR, e.g. 7.2)")
     p.add_argument("--title", required=True, help="Phase title")
@@ -1873,6 +2013,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task", dest="task_id", metavar="TASK_ID", help="Only this task's events")
     p.add_argument("--limit", type=int, default=50, help="Show the last N events (default 50)")
     p.set_defaults(func=cmd_history)
+
+    p = add_command("conflicts", "List writes the hub refused as stale (read-only)",
+                    json_out=True)
+    p.set_defaults(func=cmd_conflicts)
 
     p = add_command("convert", "Render the todo file as markdown")
     p.add_argument("-o", "--output", help="Write to this file instead of stdout")
@@ -1901,6 +2045,8 @@ def build_parser() -> argparse.ArgumentParser:
     integrations.add_parser(sub)
     from tidetable import tui
     tui.add_parser(sub)
+    from tidetable import mint
+    mint.add_parser(sub)
     return parser
 
 

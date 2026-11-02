@@ -273,6 +273,11 @@ tidetable deps docs/todo-v7.json 7.0.1
 # Add a task (new ID is the phase's max sequence + 1)
 tidetable add docs/todo-v7.json --phase 7.2 --title "New feature"   --goal "..." --prereq 7.0.1 --complexity High --agent pro_dev_agent
 
+# Edit a task's plan fields (status is separate: start/done/status). Lists are replaced whole;
+# --clear-* empties one; dangling or cyclic prerequisites are refused.
+tidetable edit docs/todo-v7.json 7.2.1 --title "Clearer title" --touches tui/src/   --success "it works" --tests "cargo test"
+tidetable edit docs/todo-v7.json 7.2.1 --clear-parallel-group
+
 # Add a phase (new ID must be MAJOR.MINOR and unused; starts empty)
 tidetable add-phase docs/todo-v7.json --phase 7.3 --title "Hardening"   --goal "..." --prereq 7.2 --after 7.2
 
@@ -281,7 +286,7 @@ tidetable convert docs/todo-v7.json -o docs/todo-v7.md
 
 # Single-writer core API (VPS hub): same DAG logic over HTTP, never a second implementation
 tidetable serve --port 8471 --registry deploy/registry.json
-# GET /api/<slug>/ready|next|list|deps|history|validate|parallel, POST .../start|done|reset|status|add|heartbeat, GET /api/stream (SSE)
+# GET /api/<slug>/ready|next|list|deps|history|validate|parallel, POST .../start|done|reset|status|add|add-phase|edit|look-defer|look-clear|heartbeat, GET /api/stream (SSE)
 
 # Harness sidebars: budgeted current/concurrent/upcoming/phase-tree/overall payload
 tidetable sidebar docs/todo-v7.json --width 80 --height 40 --json
@@ -313,9 +318,12 @@ tidetable agents set pro_dev_agent --model claude-opus-5 --scope repo
 `tidetable tui [--mode auto|standard|side|bottom] [--tmux] [-- TUI_ARGS]` launches the
 `tidetable-tui` binary (build: `cargo build --release --manifest-path tui/Cargo.toml`). It
 shows Now / Upcoming / Done / Review for a todo file or hub project (`--server URL SLUG`,
-token from `$TIDETABLE_TOKEN`). Humans use it; agents keep using the CLI. It never writes a
-todo file: `s` start, `d` done, `l` defer, `c` clear and `x` reject all run the CLI (`--read-only`
-disables them). Details: `docs/integration-guide.md`.
+token from `$TIDETABLE_TOKEN`). Hub mode resolves the slug from the argument,
+`$TIDETABLE_PROJECT`, a `slug` key in `.tidetable/config.json`, or a picker; 401 and 403 stop
+retrying and say what to change. Humans use it; agents keep using the CLI. It never writes a
+todo file: `s` start, `d` done, `l` defer, `c` clear and `x` reject all run the CLI locally
+or the matching hub route (`--read-only` disables them). Details:
+`docs/integration-guide.md`.
 
 ## Attended and unattended runs
 

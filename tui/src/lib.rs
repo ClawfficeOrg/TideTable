@@ -8,6 +8,7 @@ pub mod hub;
 pub mod motion;
 pub mod refresh;
 pub mod review;
+pub mod slug;
 pub mod source;
 pub mod theme;
 pub mod ui;

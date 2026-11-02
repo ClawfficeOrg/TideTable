@@ -158,6 +158,8 @@ pub enum Load {
     Ready,
     /// Several todo files matched; the user picks one (never a prompt on stdin).
     Pick(Vec<std::path::PathBuf>),
+    /// Hub mode has no slug; the user picks a project (slug, name).
+    PickProjects(Vec<(String, String)>),
     Failed(String),
 }
 
@@ -197,6 +199,10 @@ pub struct App {
     pub toast: Option<(String, bool)>,
     /// A todo file the user chose in the picker; main hands it to the source.
     pub chosen: Option<std::path::PathBuf>,
+    /// A hub project slug chosen in the picker; main rebuilds the hub source.
+    pub chosen_slug: Option<String>,
+    /// Cursor in the hub project picker.
+    pub pick_sel: usize,
 }
 
 /// The draggable boundary between list and detail, as drawn last frame.
@@ -254,6 +260,8 @@ impl App {
             pending: None,
             toast: None,
             chosen: None,
+            chosen_slug: None,
+            pick_sel: 0,
         }
     }
 
@@ -304,10 +312,11 @@ impl App {
                     };
                     let age = r.age_secs(self.now_epoch).map_or("?".into(), fmt_age);
                     let owner = r.owner.as_deref().unwrap_or("unclaimed");
-                    let lease = if r.lease_expired {
-                        "lease expired"
-                    } else {
-                        "lease ok"
+                    let lease = match r.lease_left_secs(self.now_epoch) {
+                        Some(left) if left > 0 => format!("lease {} left", fmt_age(left)),
+                        Some(_) => "lease expired".to_string(),
+                        None if r.lease_expired => "lease expired".to_string(),
+                        None => "lease ok".to_string(),
                     };
                     let mut sub = vec![format!("{owner} · {age} · {lease}")];
                     if let Some(d) = s.details.get(&r.id).filter(|d| !d.goal.is_empty()) {
@@ -576,6 +585,26 @@ impl App {
             return;
         }
         self.toast = None;
+        if let Load::PickProjects(projects) = &self.load {
+            let last = projects.len().saturating_sub(1);
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => self.pick_sel = (self.pick_sel + 1).min(last),
+                KeyCode::Char('k') | KeyCode::Up => self.pick_sel = self.pick_sel.saturating_sub(1),
+                KeyCode::Enter => {
+                    if let Some((slug, _)) = projects.get(self.pick_sel) {
+                        self.chosen_slug = Some(slug.clone());
+                    }
+                }
+                KeyCode::Char(c @ ('1'..='9')) => {
+                    if let Some((slug, _)) = projects.get(c as usize - '1' as usize) {
+                        self.chosen_slug = Some(slug.clone());
+                    }
+                }
+                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
         if let (Load::Pick(files), KeyCode::Char(c @ '1'..='9')) = (&self.load, k.code) {
             self.chosen = files.get(c as usize - '1' as usize).cloned();
             return;
@@ -676,11 +705,23 @@ impl App {
                 });
                 Some((Status::Blocked, format!("offline · retry {retry_in}s{age}")))
             }
+            Conn::Denied { forbidden: false } => Some((
+                Status::Blocked,
+                "token rejected · set $TIDETABLE_TOKEN".into(),
+            )),
+            Conn::Denied { forbidden: true } => Some((
+                Status::Blocked,
+                "no access to this project · ask for a scoped token".into(),
+            )),
         }
     }
 
     pub fn is_offline(&self) -> bool {
         matches!(self.conn, Conn::Offline { .. })
+    }
+
+    pub fn is_denied(&self) -> bool {
+        matches!(self.conn, Conn::Denied { .. })
     }
 }
 

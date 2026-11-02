@@ -33,6 +33,9 @@ _WRITE_LOCK = threading.Lock()
 #: locked reload-mutate-write path as the CLI. Presence lives in
 #: tidetable.sessions (1.1.3); per-project machine tokens in
 #: tidetable.tokens (1.4.1).
+#: most bytes read from an unauthenticated request body before answering 401/403.
+_UNAUTH_DRAIN_LIMIT = 64 * 1024
+
 ROUTES: dict[tuple[str, str], str] = {
     ("GET", "/api/projects"): "cmd_list",
     ("GET", "/api/{slug}/ready"): "cmd_ready",
@@ -45,6 +48,8 @@ ROUTES: dict[tuple[str, str], str] = {
     ("GET", "/api/{slug}/parallel"): "cmd_parallel",
     ("GET", "/api/{slug}/sessions"): "sessions",
     ("GET", "/api/{slug}/sidebar"): "sidebar",
+    ("GET", "/api/{slug}/base"): "base",
+    ("GET", "/api/{slug}/conflicts"): "cmd_conflicts",
     ("GET", "/api/stream"): "stream",
     ("POST", "/api/{slug}/start"): "cmd_start",
     ("POST", "/api/{slug}/done"): "cmd_done",
@@ -52,6 +57,9 @@ ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/api/{slug}/status"): "cmd_status",
     ("POST", "/api/{slug}/add"): "cmd_add",
     ("POST", "/api/{slug}/add-phase"): "cmd_add_phase",
+    ("POST", "/api/{slug}/edit"): "cmd_edit",
+    ("POST", "/api/{slug}/look-defer"): "cmd_look_defer",
+    ("POST", "/api/{slug}/look-clear"): "cmd_look_clear",
     ("POST", "/api/{slug}/heartbeat"): "heartbeat",
 }
 
@@ -135,6 +143,30 @@ def bearer_auth(headers: Mapping[str, str], slug: str | None = None,
         # TK_API_TOKEN fallback only.
         return True, False
     return False, False
+
+
+def allowed_slugs(headers: Mapping[str, str], registry: str = DEFAULT_REGISTRY,
+                  tokens_db: str | None = None) -> list[str] | None:
+    """Slugs a presented machine token may see, or None for full access.
+
+    The shared TK_API_TOKEN and any unverified token (the caller already passed
+    auth) see everything. A scoped machine token sees exactly its slugs; that is
+    what keeps ``GET /api/projects`` from naming a project it cannot open.
+    """
+    presented = _extract_presented(headers)
+    if not presented:
+        return None
+    try:
+        verified = tokens_store.verify_token(
+            _resolve_tokens_db(registry, tokens_db), presented)
+    except (OSError, ValueError):
+        return None
+    if verified is None:
+        return None
+    slugs, _ = verified
+    if "*" in slugs:
+        return None
+    return list(slugs)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -370,15 +402,21 @@ def format_sse(payload: dict, seq: int | None = None,
 
 def handle_get(route: str, slug: str | None, query: Mapping[str, str],
                registry: str = DEFAULT_REGISTRY,
-               sessions_db: str | None = None) -> tuple[int, dict]:
+               sessions_db: str | None = None,
+               visible_slugs: list[str] | None = None) -> tuple[int, dict]:
     """Serve one GET read by delegating to tidetable.cli — no DAG logic here.
 
     Returns (status, payload) where payload matches the CLI --json shape for
     the same read. Raises FileNotFoundError for a missing registry/todo file.
+    ``visible_slugs`` (a scoped machine token's slugs; None means all) filters
+    the project list so it never names a project the caller cannot open.
     """
     if route == "/api/projects":
         data = load_registry(registry)
-        return 200, {"projects": data.get("projects", [])}
+        projects = data.get("projects", [])
+        if visible_slugs is not None:
+            projects = [p for p in projects if p.get("slug") in visible_slugs]
+        return 200, {"projects": projects}
 
     if slug is None:
         return 400, {"error": "missing slug"}
@@ -508,7 +546,73 @@ def handle_get(route: str, slug: str | None, query: Mapping[str, str],
         db = _resolve_sessions_db(registry, sessions_db)
         return 200, {"slug": slug, "sessions": sessions_store.list_sessions(db, slug)}
 
+    if route == "/api/{slug}/base":
+        return 200, {"slug": slug, "base": event_base(todo_path)}
+
+    if route == "/api/{slug}/conflicts":
+        return 200, {"path": str(cli.conflicts_path(todo_path)),
+                     "conflicts": cli.read_conflicts(todo_path)}
+
     return 404, {"error": f"unknown route: {route}"}
+
+
+def event_base(todo_path: str) -> int:
+    """The hub's version for a slug: how many events its log holds.
+
+    A write carries the base it saw when it decided; the hub compares it with
+    this count to tell whether the task moved underneath the writer.
+    """
+    return len(cli.read_events(todo_path))
+
+
+#: A base that is not a non-negative integer.
+_BAD_BASE = object()
+
+
+def _parse_base(value: object) -> object:
+    """``None`` when absent, an ``int`` when valid, else ``_BAD_BASE``."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return None
+    if isinstance(value, bool):
+        return _BAD_BASE
+    try:
+        base = int(str(value).strip())
+    except ValueError:
+        return _BAD_BASE
+    return base if base >= 0 else _BAD_BASE
+
+
+def _stale_base(todo_path: str, route: str, task_id: str, base: int, owner: str,
+                body: Mapping[str, object], *,
+                keep_none: bool = False) -> tuple[int, dict] | None:
+    """409 when ``task_id`` changed after ``base``; the refusal goes on the conflict list.
+
+    Called inside the write lock, so the events read here are the ones the
+    write would land after. A base beyond the log (rotated, or from another
+    hub) is a conflict too: the hub cannot vouch for what the writer saw.
+    Nothing ever replays a recorded conflict; a person reads the list and
+    decides.
+
+    ``keep_none`` keeps null fields in the recorded request: to ``edit`` a
+    null is a ``--clear-*`` and dropping it would misreport what was refused.
+    """
+    events = cli.read_events(todo_path)
+    current = len(events)
+    since = [e for e in events[base:] if e.get("task") == task_id] if base <= current else []
+    if base <= current and not since:
+        return None
+    cli.append_conflict(todo_path, {
+        "at": cli.utc_now(),
+        "route": route.rsplit("/", 1)[-1],
+        "task": task_id,
+        "owner": owner,
+        "base": base,
+        "current": current,
+        "changed_by": [{k: e.get(k) for k in ("at", "event", "owner", "from", "to")
+                        if e.get(k) is not None} for e in since],
+        "request": {k: v for k, v in body.items() if keep_none or v is not None},
+    })
+    return 409, {"conflict": True, "task": task_id, "base": base, "current": current}
 
 
 def _body_truthy(value: object) -> bool:
@@ -550,6 +654,9 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
     data_in: dict = dict(body or {})
     owner = str(data_in.get("owner") or data_in.get("actor") or cli.default_owner())
     extras = _body_extras(data_in)
+    base = _parse_base(data_in.get("base"))
+    if base is _BAD_BASE:
+        return 400, {"error": "base must be a non-negative integer (GET /api/<slug>/base)"}
     db = _resolve_sessions_db(registry, sessions_db)
 
     if route == "/api/{slug}/heartbeat":
@@ -593,6 +700,10 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                 phase, task = cli.find_task(data, task_id)
                 if task is None:
                     return 404, {"error": f"task {task_id} not found"}
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
                 if task.get("status") == "done":
                     return 409, {"error": f"task {task_id} is already done. Use reset to reopen it."}
                 stolen_from = None
@@ -656,6 +767,11 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                         "release_ready": False,
                         "release": cli.release_state(phase) if phase else None,
                     }
+                # After already_done, so a retried done stays idempotent.
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
                 holder = task.get("claimed_by")
                 if (task.get("status") == "in_progress" and holder and holder != owner
                         and not cli.lease_expired(task) and not force):
@@ -700,14 +816,28 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                       or data_in.get("id") or "").strip()
         if not task_id:
             return 400, {"error": "missing task=<id>"}
+        # Reset throws away someone's claim or finished work, so it never runs blind.
+        if base is None:
+            return 428, {"error": "reset needs base=<event count> "
+                                  "(GET /api/<slug>/base when you decide)"}
+        force = _body_truthy(data_in.get("force"))
         with _WRITE_LOCK:
             with FileLock(todo_path):
                 data = cli.load_todo(todo_path)
                 _, task = cli.find_task(data, task_id)
                 if task is None:
                     return 404, {"error": f"task {task_id} not found"}
+                stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                if stale:
+                    return stale
                 previous = task.get("status")
                 held_by = task.get("claimed_by")
+                if (previous == "in_progress" and held_by and held_by != owner
+                        and not cli.lease_expired(task) and not force):
+                    return 409, {
+                        "error": f"task {task_id} is held by {held_by} until "
+                                 f"{task.get('lease_expires_at')}; reset refused.",
+                    }
                 cli.set_status(data, task_id, "pending")
                 cli.save_todo(data, todo_path)
                 cli.record_event(todo_path, "reset", task=task_id, owner=owner,
@@ -744,6 +874,10 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                     return 404, {"error": f"task {task_id} not found"}
                 if moved_to_text and cli.find_task(data, moved_to_text)[1] is None:
                     return 404, {"error": f"moved_to target {moved_to_text} does not exist"}
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
                 previous = task.get("status")
                 cli.set_status(data, task_id, status, moved_to_text)
                 cli.save_todo(data, todo_path)
@@ -876,6 +1010,148 @@ def handle_post(route: str, slug: str | None, body: Mapping[str, object] | None,
                 cli.record_event(todo_path, "add-phase", **event_fields)
                 return 200, {"phase": phase, "id": phase["id"]}
 
+    if route == "/api/{slug}/look-defer":
+        task_id = str(data_in.get("task") or data_in.get("task_id")
+                      or data_in.get("id") or "").strip()
+        if not task_id:
+            return 400, {"error": "missing task=<id>"}
+        note = _text(data_in.get("note"))
+        with _WRITE_LOCK:
+            with FileLock(todo_path):
+                data = cli.load_todo(todo_path)
+                _, task = cli.find_task(data, task_id)
+                if task is None:
+                    return 404, {"error": f"task {task_id} not found"}
+                previous = task.get("status")
+                if previous == "done":
+                    return 200, {
+                        "task": task_id,
+                        "already_done": True,
+                        "from": previous,
+                        "to": previous,
+                    }
+                # After already_done, which writes nothing, as done does.
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
+                cli.set_status(data, task_id, cli.LOOK)
+                task["human_look"] = note or task.get("human_look", "")
+                cli.save_todo(data, todo_path)
+                cli.record_event(todo_path, "look_defer", task=task_id, owner=owner,
+                                 **{"from": previous, "to": cli.LOOK}, note=note,
+                                 **extras)
+                return 200, {
+                    "task": task_id,
+                    "from": previous,
+                    "to": cli.LOOK,
+                    "note": task["human_look"],
+                }
+
+    if route == "/api/{slug}/look-clear":
+        task_id = str(data_in.get("task") or data_in.get("task_id")
+                      or data_in.get("id") or "").strip()
+        if not task_id:
+            return 400, {"error": "missing task=<id>"}
+        reject = _body_truthy(data_in.get("reject"))
+        with _WRITE_LOCK:
+            with FileLock(todo_path):
+                data = cli.load_todo(todo_path)
+                _, task = cli.find_task(data, task_id)
+                if task is None:
+                    return 404, {"error": f"task {task_id} not found"}
+                if task.get("status") != cli.LOOK:
+                    return 409, {
+                        "error": f"task {task_id} is {task.get('status')}, not {cli.LOOK}",
+                    }
+                # After the look check, so a duplicate clear keeps its plain 409
+                # and stays off the conflict list.
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in)
+                    if stale:
+                        return stale
+                target = "pending" if reject else "done"
+                cli.set_status(data, task_id, target)
+                task.pop("human_look", None)
+                cli.save_todo(data, todo_path)
+                cli.record_event(todo_path, "look_clear", task=task_id, owner=owner,
+                                 **{"from": cli.LOOK, "to": target}, **extras)
+                return 200, {
+                    "task": task_id,
+                    "from": cli.LOOK,
+                    "to": target,
+                }
+
+    if route == "/api/{slug}/edit":
+        task_id = str(data_in.get("task") or data_in.get("task_id")
+                      or data_in.get("id") or "").strip()
+        if not task_id:
+            return 400, {"error": "missing task=<id>"}
+        updates: dict = {}
+        for key in ("title", "goal", "tests", "complexity", "agent"):
+            if key in data_in:
+                updates[key] = data_in[key]
+        if "parallel_group" in data_in or "parallelGroup" in data_in:
+            updates["parallel_group"] = data_in.get(
+                "parallel_group", data_in.get("parallelGroup"))
+        for key, aliases in (("touches", ("touches",)),
+                             ("success", ("success",)),
+                             ("prerequisites", ("prerequisites", "prereq"))):
+            for alias in aliases:
+                if alias not in data_in:
+                    continue
+                value = data_in[alias]
+                if value is None:
+                    updates[key] = []
+                elif isinstance(value, str):
+                    updates[key] = [value]
+                elif isinstance(value, list):
+                    updates[key] = value
+                else:
+                    return 400, {"error": f"{key} must be a list of strings"}
+                break
+        if not updates:
+            return 400, {"error": "nothing to edit; pass at least one field"}
+        if "title" in updates and not _text(updates["title"]):
+            return 400, {"error": "title cannot be empty"}
+        if "complexity" in updates and updates["complexity"] not in (
+                "Low", "Medium", "High", "Very High"):
+            return 400, {"error": f"invalid complexity: {updates['complexity']}"}
+        if "agent" in updates and updates["agent"] not in (
+                "basic_dev_agent", "mid_dev_agent", "pro_dev_agent", "flagship"):
+            return 400, {"error": f"invalid agent: {updates['agent']}"}
+        with _WRITE_LOCK:
+            with FileLock(todo_path):
+                data = cli.load_todo(todo_path)
+                _, task = cli.find_task(data, task_id)
+                if task is None:
+                    return 404, {"error": f"task {task_id} not found"}
+                if task_id in updates.get("prerequisites", []):
+                    return 400, {"error": f"task {task_id} cannot require itself"}
+                for dep in updates.get("prerequisites", []):
+                    if cli.find_task(data, dep)[1] is None:
+                        return 404, {"error": f"prerequisite {dep} does not exist"}
+                if isinstance(base, int):
+                    stale = _stale_base(todo_path, route, task_id, base, owner, data_in,
+                                        keep_none=True)
+                    if stale:
+                        return stale
+                before, _ = cli.semantic_errors(data)
+                cli.edit_task(data, task_id, **updates)
+                after, _ = cli.semantic_errors(data)
+                introduced = [e for e in after if e not in before]
+                if introduced:
+                    return 422, {"error": "; ".join(introduced)}
+                cli.save_todo(data, todo_path)
+                cli.record_event(todo_path, "edit", task=task_id, owner=owner,
+                                 fields=sorted(updates), **extras)
+                tiers = cli.resolved_tiers(data, todo_path)
+                return 200, {
+                    "task": cli.task_summary(task, tiers),
+                    "changed": sorted(updates),
+                }
+
+
     return 404, {"error": f"unknown route: {route}"}
 
 
@@ -931,8 +1207,50 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ValueError):
             pass
 
+    def _admin_mint_token(self) -> None:
+        """``POST /api/admin/tokens``: mint a machine token for one project.
+
+        Admin only: the shared ``TK_API_TOKEN``. A machine token cannot mint
+        more machine tokens, so a leaked project token cannot widen itself.
+        """
+        from tidetable import mint as mint_cli
+
+        expected = os.environ.get("TK_API_TOKEN", "")
+        presented = _extract_presented(self.headers)  # type: ignore[arg-type]
+        try:
+            length = max(0, int(self.headers.get("Content-Length", "0") or "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(min(length, 65536)) if length else b""
+        if not expected or not presented or not hmac.compare_digest(presented, expected):
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw.strip() else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"error": "invalid JSON body"})
+            return
+        registry = getattr(self.server, "registry", DEFAULT_REGISTRY)
+        request, reason = mint_cli.validate_request(body, mint_cli.registry_slugs(registry))
+        if reason:
+            self._send_json(400, {"error": reason})
+            return
+        tokens_db = getattr(self.server, "tokens_db", None) or _resolve_tokens_db(registry)
+        tokens_store.init_db(tokens_db)
+        _, token, _ = tokens_store.mint_token(
+            tokens_db, request["slugs"], request["scopes"], request["days"])
+        self._send_json(201, {
+            "token": token,
+            "slugs": request["slugs"],
+            "scopes": request["scopes"],
+            "expires_days": request["days"],
+        })
+
     def _handle(self) -> None:
         raw_path = urlsplit(self.path).path
+        if self.command == "POST" and raw_path == "/api/admin/tokens":
+            self._admin_mint_token()
+            return
         route, slug = match_route(self.command, raw_path)
         if route is None:
             # Auth first so scanners cannot probe the route table unauthenticated.
@@ -955,6 +1273,18 @@ class _Handler(BaseHTTPRequestHandler):
             tokens_db=getattr(self.server, "tokens_db", None),
         )
         if not ok:
+            # Drain the request body first: closing with it unread makes the kernel reset the
+            # connection, and a POST client then sees ECONNRESET instead of the 401/403.
+            # The read is capped because the caller is unauthenticated; a larger body is
+            # left unread and the connection closed, which is the old behaviour.
+            try:
+                length = max(0, int(self.headers.get("Content-Length", "0") or "0"))
+                if length <= _UNAUTH_DRAIN_LIMIT:
+                    self.rfile.read(length)
+                else:
+                    self.close_connection = True
+            except (ValueError, OSError):
+                pass
             self.send_response(403 if forbidden else 401)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -972,7 +1302,13 @@ class _Handler(BaseHTTPRequestHandler):
             registry = getattr(self.server, "registry", DEFAULT_REGISTRY)
             sessions_db = getattr(self.server, "sessions_db", None)
             try:
-                status, payload = handle_get(route, slug, query, registry, sessions_db)
+                visible = (allowed_slugs(
+                    self.headers,  # type: ignore[arg-type]
+                    registry,
+                    getattr(self.server, "tokens_db", None))
+                    if route == "/api/projects" else None)
+                status, payload = handle_get(
+                    route, slug, query, registry, sessions_db, visible)
             except FileNotFoundError as e:
                 self._send_json(404, {"error": f"not found: {e.filename or e}"})
                 return
