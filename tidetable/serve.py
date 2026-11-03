@@ -1246,8 +1246,43 @@ class _Handler(BaseHTTPRequestHandler):
             "expires_days": request["days"],
         })
 
+    def _admin_register_project(self) -> None:
+        """``POST /api/admin/projects``: add a project to the hub registry.
+
+        Admin only, same ``TK_API_TOKEN`` check as the token mint. The registry
+        file is the source of truth, so the entry is written there and the
+        hub sees it on the next request.
+        """
+        from tidetable import register as register_cli
+
+        expected = os.environ.get("TK_API_TOKEN", "")
+        presented = _extract_presented(self.headers)  # type: ignore[arg-type]
+        try:
+            length = max(0, int(self.headers.get("Content-Length", "0") or "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(min(length, 65536)) if length else b""
+        if not expected or not presented or not hmac.compare_digest(presented, expected):
+            self._send_json(401, {"error": "unauthorized"})
+            return
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw.strip() else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"error": "invalid JSON body"})
+            return
+        registry = getattr(self.server, "registry", DEFAULT_REGISTRY)
+        entry, reason = register_cli.add_project(registry, body)
+        if reason:
+            status = 409 if "already registered" in reason else 400
+            self._send_json(status, {"error": reason})
+            return
+        self._send_json(201, entry)
+
     def _handle(self) -> None:
         raw_path = urlsplit(self.path).path
+        if self.command == "POST" and raw_path == "/api/admin/projects":
+            self._admin_register_project()
+            return
         if self.command == "POST" and raw_path == "/api/admin/tokens":
             self._admin_mint_token()
             return

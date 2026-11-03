@@ -2047,6 +2047,8 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_parser(sub)
     from tidetable import mint
     mint.add_parser(sub)
+    from tidetable import register
+    register.add_parser(sub)
     return parser
 
 
